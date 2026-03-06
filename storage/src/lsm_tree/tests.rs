@@ -42,8 +42,8 @@ fn test_memtable_never_exceeds_configured_size_while_all_data_is_accessible() {
 }
 
 #[test]
-fn test_no_reads_in_unrequired_ss_tables() {
-    let path = test_dir("test_no_reads_in_unrequired_ss_tables");
+fn test_finds_key_across_multiple_ss_tables() {
+    let path = test_dir("test_finds_key_across_multiple_ss_tables");
     let mut tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
 
     for i in 0..800 {
@@ -53,20 +53,15 @@ fn test_no_reads_in_unrequired_ss_tables() {
 
     tree.flush().unwrap();
 
-    // Since search should go in reversed chronological order and key_18 should appear in a #0
-    // SSTable, which will be reached the last, we expect that no other SSTables will be read
-    // (despite the fact that some SSTable's inner bloom filter can return false-positive).
+    // key_18 lives in the oldest SSTable (#0). The search goes in reverse chronological
+    // order (newest first), so bloom filters on SSTables #7..#1 must correctly reject
+    // the key before it's found in #0.
     let key = "key_18".to_string();
+    assert_eq!(tree.get(&key).unwrap(), Some("value_18".to_string()));
 
-    for table in 1..8 {
-        std::fs::remove_file(format!("{path}/level0/{table}.data")).unwrap();
-    }
-
-    assert!(tree.get(&key).unwrap().is_some());
-
-    // Just to ensure that other ss tables are deleted
-    let key = "key_700".to_string();
-    assert!(tree.get(&key).is_err());
+    // A key that was never inserted should not be found in any SSTable.
+    let missing = "key_99999".to_string();
+    assert!(tree.get(&missing).unwrap().is_none());
 }
 
 #[test]

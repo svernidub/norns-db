@@ -72,7 +72,7 @@ impl BitMap {
 
     #[inline]
     pub fn byte_size(&self) -> usize {
-        self.map.len()
+        self.map.len() * size_of::<u64>()
     }
 
     #[inline]

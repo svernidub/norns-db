@@ -2,25 +2,32 @@
 mod tests;
 
 use crate::bloom_filter::BloomFilter;
+use crate::io::read_at;
 use std::{
     collections::BTreeMap,
     error::Error,
     fs::File,
     hash::Hash,
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read, Seek, Write},
     marker::PhantomData,
 };
 
 pub struct SsTable<K, V> {
     bloom_filter: BloomFilter<K>,
-    block_index: BTreeMap<K, u64>,
-    table_data_path: String,
+    block_index: BTreeMap<K, BlockIndexEntry>,
+    data_file: File,
     _marker: PhantomData<V>,
 }
 
 pub struct SsTableIter<K, V> {
     reader: BufReader<File>,
     phantom_data: PhantomData<(K, V)>,
+}
+
+#[derive(bincode::Decode, bincode::Encode)]
+struct BlockIndexEntry {
+    offset: u64,
+    length: u64,
 }
 
 impl<K, V> Iterator for SsTableIter<K, V>
@@ -58,13 +65,16 @@ where
     ) -> Result<Self, Box<dyn Error>> {
         debug_assert!(data.len() > 0);
 
-        let mut data_writer = BufWriter::new(File::create(format!("{table_path}.data"))?);
+        let data_file_name = format!("{table_path}.data");
+
+        let mut data_writer = BufWriter::new(File::create(&data_file_name)?);
 
         let mut bloom_filter = BloomFilter::new(data.len(), 0.1);
-        let mut block_index: BTreeMap<K, u64> = BTreeMap::new();
+        let mut block_index: BTreeMap<K, BlockIndexEntry> = BTreeMap::new();
 
         let mut block = Vec::new();
         let mut block_index_key = None;
+        let mut length = 0u64;
 
         for (i, (key, value)) in data.into_iter().enumerate() {
             bloom_filter.add(&key);
@@ -75,27 +85,29 @@ where
 
             let data = bincode::encode_to_vec(&(key, value), bincode::config::standard())?;
             block.extend(&data);
+            length += data.len() as u64;
 
             if (i + 1) % block_size == 0 {
-                let pos = data_writer.stream_position()?;
-                block_index.insert(block_index_key.unwrap(), pos);
+                let offset = data_writer.stream_position()?;
+                block_index.insert(block_index_key.unwrap(), BlockIndexEntry { offset, length });
 
                 data_writer.write_all(&block)?;
                 block.clear();
 
                 block_index_key = None;
+                length = 0;
             };
         }
 
         if !block.is_empty() {
-            let pos = data_writer.stream_position()?;
-            block_index.insert(block_index_key.unwrap(), pos);
-
+            let offset = data_writer.stream_position()?;
+            block_index.insert(block_index_key.unwrap(), BlockIndexEntry { offset, length });
             data_writer.write_all(&block)?;
             block.clear();
         }
 
         data_writer.flush()?;
+        data_writer.get_mut().sync_data()?;
 
         Self::serialize_on_disk(&block_index, format!("{table_path}.idx"))?;
         Self::serialize_on_disk(&bloom_filter, format!("{table_path}.bloom"))?;
@@ -103,7 +115,7 @@ where
         Ok(Self {
             bloom_filter,
             block_index,
-            table_data_path: format!("{table_path}.data"),
+            data_file: File::open(data_file_name)?,
             _marker: Default::default(),
         })
     }
@@ -134,7 +146,7 @@ where
         Ok(Self {
             bloom_filter,
             block_index,
-            table_data_path: format!("{table_path}.data"),
+            data_file: File::open(format!("{table_path}.data"))?,
             _marker: Default::default(),
         })
     }
@@ -144,37 +156,29 @@ where
             return Ok(None);
         }
 
-        let Some((index_key, pos)) = self.block_index.range(..=key.to_owned()).next_back() else {
-            return Ok(None); // index does not cover the value? Maybe it's empty...
+        let Some((_index_key, &BlockIndexEntry { offset, length })) =
+            self.block_index.range(..=key).next_back()
+        else {
+            return Ok(None);
         };
 
-        let stop_search = self
-            .block_index
-            .range(index_key.to_owned()..)
-            .nth(1)
-            .map(|(_, pos)| *pos);
+        // Reading an entire block by index. The item *can* be somewhere in the middle of the block.
+        let mut buf = vec![0u8; length as usize];
+        read_at(&self.data_file, &mut buf, offset)?;
 
-        let mut data_reader = BufReader::new(File::open(&self.table_data_path)?);
+        let mut cursor_offset = 0usize;
 
-        data_reader.seek(SeekFrom::Start(*pos))?;
-
-        while stop_search.is_none() || Some(data_reader.stream_position()?) <= stop_search {
-            let result = bincode::decode_from_reader::<(K, V), _, _>(
-                &mut data_reader,
+        while cursor_offset < buf.len() {
+            let ((k, v), bytes_read) = bincode::decode_from_slice::<(K, V), _>(
+                &buf[cursor_offset..],
                 bincode::config::standard(),
-            );
+            )?;
 
-            match result {
-                Ok((pos_key, _)) if key != &pos_key => {
-                    continue;
-                }
-                Ok((_, value)) => return Ok(Some(value)),
-                Err(e) if matches!(&e, bincode::error::DecodeError::Io { inner, .. } if inner.kind() == std::io::ErrorKind::UnexpectedEof) =>
-                {
-                    return Ok(None);
-                }
-                Err(e) => return Err(Box::new(e)),
+            if &k == key {
+                return Ok(Some(v));
             }
+
+            cursor_offset += bytes_read;
         }
 
         Ok(None)
@@ -182,7 +186,7 @@ where
 
     pub fn iter(&self) -> Result<SsTableIter<K, V>, Box<dyn Error>> {
         Ok(SsTableIter {
-            reader: BufReader::new(File::open(&self.table_data_path)?),
+            reader: BufReader::new(self.data_file.try_clone()?),
             phantom_data: Default::default(),
         })
     }
@@ -195,6 +199,7 @@ where
         let mut writer = BufWriter::new(File::create(file_name)?);
         writer.write_all(&serialized)?;
         writer.flush()?;
+        writer.get_mut().sync_data()?;
         Ok(())
     }
 }

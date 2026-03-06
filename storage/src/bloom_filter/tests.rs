@@ -5,22 +5,22 @@ use std::collections::BTreeSet;
 fn test_filter_size() {
     let filter = BloomFilter::<u64>::new(100000, 0.2);
 
-    assert_eq!(filter.filter.byte_size(), 5235);
+    assert_eq!(filter.filter.byte_size(), 41880);
     assert_eq!(filter.hash_functions, 3);
 
     let filter = BloomFilter::<u64>::new(10000, 0.2);
 
-    assert_eq!(filter.filter.byte_size(), 524);
+    assert_eq!(filter.filter.byte_size(), 4192);
     assert_eq!(filter.hash_functions, 3);
 
     let filter = BloomFilter::<u64>::new(100000, 0.1);
 
-    assert_eq!(filter.filter.byte_size(), 7489);
+    assert_eq!(filter.filter.byte_size(), 59912);
     assert_eq!(filter.hash_functions, 4);
 
     let filter = BloomFilter::<u64>::new(10000, 0.1);
 
-    assert_eq!(filter.filter.byte_size(), 749);
+    assert_eq!(filter.filter.byte_size(), 5992);
     assert_eq!(filter.hash_functions, 4);
 }
 
