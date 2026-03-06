@@ -1,2 +1,3 @@
 # norns-db
-A toy LSM-based database
+
+A toy LSMTree-based database

@@ -1,0 +1,11 @@
+[package]
+name = "journal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dbcore = { workspace = true }
+
+bincode = { workspace = true }
+crc-fast = { workspace = true }
+tokio = { workspace = true, version = "1.0.0", features = ["rt", "sync"] }
