@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub struct Journal<K, V> {
     sender: mpsc::Sender<WriteRequest>,
+    #[allow(dead_code)]
     path: PathBuf,
     _marker: PhantomData<(K, V)>,
 }

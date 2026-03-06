@@ -98,16 +98,12 @@ fn test_compaction_moves_data_to_level_1() {
     tree.compact().unwrap();
 
     assert_eq!(
-        std::fs::read_dir(format!("{path}/level0"))
-            .unwrap()
-            .count(),
+        std::fs::read_dir(format!("{path}/level0")).unwrap().count(),
         0
     );
 
     assert_eq!(
-        std::fs::read_dir(format!("{path}/level1"))
-            .unwrap()
-            .count(),
+        std::fs::read_dir(format!("{path}/level1")).unwrap().count(),
         3 // for idx, filter and data
     );
 }

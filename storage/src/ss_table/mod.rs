@@ -63,7 +63,7 @@ where
         table_path: &str,
         block_size: usize,
     ) -> Result<Self, Box<dyn Error>> {
-        debug_assert!(data.len() > 0);
+        debug_assert!(!data.is_empty());
 
         let data_file_name = format!("{table_path}.data");
 

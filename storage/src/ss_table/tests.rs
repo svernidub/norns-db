@@ -2,7 +2,9 @@ use crate::ss_table::SsTable;
 use std::collections::BTreeMap;
 
 fn test_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("norns_db_ss_table_tests").join(name);
+    let dir = std::env::temp_dir()
+        .join("norns_db_ss_table_tests")
+        .join(name);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
