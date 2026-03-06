@@ -8,4 +8,4 @@ dbcore = { workspace = true }
 
 bincode = { workspace = true }
 crc-fast = { workspace = true }
-tokio = { workspace = true, version = "1.0.0", features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
