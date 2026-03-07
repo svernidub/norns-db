@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup component add rustfmt
-      - run: cargo fmt --all -- --check
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - run: cargo +nightly fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -32,6 +32,14 @@ jobs:
             target
           key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo clippy --all-features --all-targets -- -D warnings
+
+  machete:
+    name: Unused dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-machete
+      - run: cargo machete
 
   test:
     name: Tests

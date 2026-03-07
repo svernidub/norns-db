@@ -1,8 +1,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::bloom_filter::BloomFilter;
-use crate::io::read_at;
+use crate::{bloom_filter::BloomFilter, io::read_at};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -10,6 +9,7 @@ use std::{
     hash::Hash,
     io::{BufReader, BufWriter, Read, Seek, Write},
     marker::PhantomData,
+    path::Path,
 };
 
 pub struct SsTable<K, V> {
@@ -60,12 +60,13 @@ where
 {
     pub fn new(
         data: BTreeMap<K, V>,
-        table_path: &str,
+        table_path: impl AsRef<Path>,
         block_size: usize,
     ) -> Result<Self, Box<dyn Error>> {
         debug_assert!(!data.is_empty());
 
-        let data_file_name = format!("{table_path}.data");
+        let table_path = table_path.as_ref();
+        let data_file_name = table_path.with_extension("data");
 
         let mut data_writer = BufWriter::new(File::create(&data_file_name)?);
 
@@ -109,8 +110,8 @@ where
         data_writer.flush()?;
         data_writer.get_mut().sync_data()?;
 
-        Self::serialize_on_disk(&block_index, format!("{table_path}.idx"))?;
-        Self::serialize_on_disk(&bloom_filter, format!("{table_path}.bloom"))?;
+        Self::serialize_on_disk(&block_index, table_path.with_extension("idx"))?;
+        Self::serialize_on_disk(&bloom_filter, table_path.with_extension("bloom"))?;
 
         Ok(Self {
             bloom_filter,
@@ -120,9 +121,10 @@ where
         })
     }
 
-    pub fn load(table_path: String) -> Result<Self, Box<dyn Error>> {
+    pub fn load(table_path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
+        let table_path = table_path.as_ref();
         let block_index = {
-            let mut index_reader = BufReader::new(File::open(format!("{table_path}.idx"))?);
+            let mut index_reader = BufReader::new(File::open(table_path.with_extension("idx"))?);
             let mut index_buf = Vec::new();
             index_reader.read_to_end(&mut index_buf)?;
 
@@ -133,7 +135,7 @@ where
         };
 
         let bloom_filter = {
-            let mut bloom_reader = BufReader::new(File::open(format!("{table_path}.bloom"))?);
+            let mut bloom_reader = BufReader::new(File::open(table_path.with_extension("bloom"))?);
             let mut index_buf = Vec::new();
             bloom_reader.read_to_end(&mut index_buf)?;
 
@@ -146,7 +148,7 @@ where
         Ok(Self {
             bloom_filter,
             block_index,
-            data_file: File::open(format!("{table_path}.data"))?,
+            data_file: File::open(table_path.with_extension("data"))?,
             _marker: Default::default(),
         })
     }
@@ -191,7 +193,7 @@ where
         })
     }
 
-    fn serialize_on_disk<D>(data: &D, file_name: String) -> Result<(), Box<dyn Error>>
+    fn serialize_on_disk<D>(data: &D, file_name: impl AsRef<Path>) -> Result<(), Box<dyn Error>>
     where
         D: bincode::Encode,
     {

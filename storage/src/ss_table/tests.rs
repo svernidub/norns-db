@@ -93,9 +93,6 @@ fn ss_table(name: &str) -> SsTable<String, String> {
     }
 
     let path = test_dir(name).join("table");
-    let path_str = path.to_str().unwrap();
-
-    SsTable::<String, String>::new(data, path_str, 10).unwrap();
-
-    SsTable::<String, String>::load(path_str.to_string()).unwrap()
+    SsTable::<String, String>::new(data, &path, 10).unwrap();
+    SsTable::<String, String>::load(&path).unwrap()
 }

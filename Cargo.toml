@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["dbcore", "journal", "storage"]
+members = ["dbcore", "journal", "storage", "playground"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 dbcore = { path = "./dbcore" }
 
+arc-swap = "1.8.2"
 bincode = "2.0.1"
 crc-fast = "1.10.0"
 siphasher = "1.0.2"

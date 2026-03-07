@@ -1,4 +1,5 @@
 use crate::lsm_tree::LsmTree;
+use std::path::Path;
 
 fn test_dir(name: &str) -> String {
     let dir = std::env::temp_dir()
@@ -10,7 +11,7 @@ fn test_dir(name: &str) -> String {
 
 #[test]
 fn test_simple_insert_and_get() {
-    let mut tree = lsm_three("test_simple_insert_and_get");
+    let tree = lsm_three("test_simple_insert_and_get");
 
     let key = "Hello".to_string();
     let value = "World".to_string();
@@ -24,7 +25,7 @@ fn test_simple_insert_and_get() {
 
 #[test]
 fn test_memtable_never_exceeds_configured_size_while_all_data_is_accessible() {
-    let mut tree =
+    let tree =
         lsm_three("test_memtable_never_exceeds_configured_size_while_all_data_is_accessible");
 
     for i in 0..1000 {
@@ -32,7 +33,7 @@ fn test_memtable_never_exceeds_configured_size_while_all_data_is_accessible() {
             .unwrap();
     }
 
-    assert_eq!(tree.map.len(), 100);
+    assert_eq!(tree.memtable.read().unwrap().len(), 100);
 
     for i in 0..1000 {
         let value = tree.get(&format!("key_{i}")).unwrap();
@@ -44,7 +45,7 @@ fn test_memtable_never_exceeds_configured_size_while_all_data_is_accessible() {
 #[test]
 fn test_finds_key_across_multiple_ss_tables() {
     let path = test_dir("test_finds_key_across_multiple_ss_tables");
-    let mut tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
+    let tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
 
     for i in 0..800 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
@@ -67,7 +68,7 @@ fn test_finds_key_across_multiple_ss_tables() {
 #[test]
 fn load_tree() {
     let path = test_dir("load_tree");
-    let mut tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
+    let tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
 
     for i in 0..800 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
@@ -86,7 +87,7 @@ fn load_tree() {
 #[test]
 fn test_compaction_moves_data_to_level_1() {
     let path = test_dir("test_compaction_moves_data_to_level_1");
-    let mut tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
+    let tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
 
     // Produces 5 saved SS Tables, so 15 files
     for i in 0..500 {
@@ -98,19 +99,23 @@ fn test_compaction_moves_data_to_level_1() {
     tree.compact().unwrap();
 
     assert_eq!(
-        std::fs::read_dir(format!("{path}/level0")).unwrap().count(),
+        std::fs::read_dir(Path::new(&path).join("level0"))
+            .unwrap()
+            .count(),
         0
     );
 
     assert_eq!(
-        std::fs::read_dir(format!("{path}/level1")).unwrap().count(),
+        std::fs::read_dir(Path::new(&path).join("level1"))
+            .unwrap()
+            .count(),
         3 // for idx, filter and data
     );
 }
 
 #[test]
 fn test_after_compaction_data_is_still_accessible() {
-    let mut tree = lsm_three("test_after_compaction_data_is_still_accessible");
+    let tree = lsm_three("test_after_compaction_data_is_still_accessible");
 
     for i in 0..500 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
@@ -125,7 +130,7 @@ fn test_after_compaction_data_is_still_accessible() {
 
 #[test]
 fn test_compaction_leaves_more_recent_key_value() {
-    let mut tree = lsm_three("test_compaction_leaves_more_recent_key_value");
+    let tree = lsm_three("test_compaction_leaves_more_recent_key_value");
 
     for i in 0..5 {
         tree.insert("key".to_string(), format!("v{i}")).unwrap();
@@ -141,7 +146,7 @@ fn test_compaction_leaves_more_recent_key_value() {
 
 #[test]
 fn test_delete_if_key_exists() {
-    let mut tree = lsm_three("test_delete_if_key_exists");
+    let tree = lsm_three("test_delete_if_key_exists");
 
     for i in 0..1500 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
@@ -160,7 +165,7 @@ fn test_delete_if_key_exists() {
 
 #[test]
 fn test_skip_if_key_does_not_exist() {
-    let mut tree = lsm_three("test_skip_if_key_does_not_exist");
+    let tree = lsm_three("test_skip_if_key_does_not_exist");
 
     for i in 0..1500 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
@@ -176,7 +181,7 @@ fn test_skip_if_key_does_not_exist() {
 
 #[test]
 fn test_compaction_works_with_deletion() {
-    let mut tree = lsm_three("test_compaction_works_with_deletion");
+    let tree = lsm_three("test_compaction_works_with_deletion");
 
     for i in 0..500 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
