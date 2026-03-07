@@ -8,4 +8,6 @@ dbcore = { workspace = true }
 
 bincode = { workspace = true }
 crc-fast = { workspace = true }
+metrics = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
+tracing = { workspace = true }

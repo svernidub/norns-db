@@ -1,12 +1,15 @@
 use crate::journal_record::JournalRecord;
 use dbcore::error::NornsDbError;
+use metrics::{counter, histogram};
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
+    time::Instant,
 };
 use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, trace};
 
 pub struct Journal<K, V> {
     sender: mpsc::Sender<WriteRequest>,
@@ -28,7 +31,10 @@ impl<K, V> Journal<K, V> {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|e| NornsDbError::unknown_with_message(e, "Failed to open journal file"))?;
+            .map_err(|e| {
+                error!(path = %path.display(), error = %e, "failed to open journal file");
+                NornsDbError::unknown_with_message(e, "Failed to open journal file")
+            })?;
 
         // TODO: make configurable?
         let (sender, receiver) = mpsc::channel(256);
@@ -37,6 +43,8 @@ impl<K, V> Journal<K, V> {
         tokio::task::spawn_blocking(move || {
             Self::run_writer_loop(file, receiver, &writer_path);
         });
+
+        debug!(path = %path.display(), "journal opened");
 
         Ok(Self {
             sender,
@@ -51,10 +59,13 @@ impl<K, V> Journal<K, V> {
         V: bincode::Encode,
     {
         let payload = bincode::encode_to_vec(record, bincode::config::standard()).map_err(|e| {
+            error!(error = %e, "failed to encode journal record");
             NornsDbError::unknown_with_message(e, "Failed to encode journal record")
         })?;
 
         let (done_tx, done_rx) = oneshot::channel::<Result<(), NornsDbError>>();
+
+        debug!(payload_size = payload.len(), "appending journal record");
 
         self.sender
             .send(WriteRequest {
@@ -62,20 +73,27 @@ impl<K, V> Journal<K, V> {
                 done: done_tx,
             })
             .await
-            .map_err(|e| NornsDbError::unknown_with_message(e, "Failed to send journal record"))?;
+            .map_err(|e| {
+                error!(error = %e, "failed to send journal record to writer");
+                NornsDbError::unknown_with_message(e, "Failed to send journal record")
+            })?;
 
         done_rx.await.map_err(|e| {
+            error!(error = %e, "journal writer dropped without responding");
             NornsDbError::unknown_with_message(e, "Failed to process journal record")
         })?
     }
 
-    fn run_writer_loop(file: File, mut receiver: mpsc::Receiver<WriteRequest>, _path: &Path) {
+    fn run_writer_loop(file: File, mut receiver: mpsc::Receiver<WriteRequest>, path: &Path) {
+        debug!(path = %path.display(), "journal writer loop started");
         let mut writer = BufWriter::new(file);
 
         while let Some(request) = receiver.blocking_recv() {
             let result = Self::write_record(&mut writer, &request.payload);
             let _ = request.done.send(result);
         }
+
+        debug!(path = %path.display(), "journal writer loop stopped");
     }
 
     // Write a record to the journal with the next layout:
@@ -85,12 +103,27 @@ impl<K, V> Journal<K, V> {
         let len = payload.len() as u32;
         let checksum = crc_fast::crc32_iscsi(payload);
 
-        writer
+        trace!(payload_len = len, checksum, "writing journal record");
+
+        let start = Instant::now();
+        let result = writer
             .write_all(&len.to_le_bytes())
             .and_then(|_| writer.write_all(payload))
             .and_then(|_| writer.write_all(&checksum.to_le_bytes()))
             .and_then(|_| writer.flush())
             .and_then(|_| writer.get_mut().sync_all())
-            .map_err(|e| NornsDbError::unknown_with_message(e, "Failed to write journal record"))
+            .map_err(|e| {
+                error!(error = %e, "failed to write journal record to disk");
+                NornsDbError::unknown_with_message(e, "Failed to write journal record")
+            });
+
+        histogram!("journal.write_duration_seconds").record(start.elapsed().as_secs_f64());
+
+        if result.is_ok() {
+            counter!("journal.records_written").increment(1);
+            histogram!("journal.record_bytes").record(len as f64);
+        }
+
+        result
     }
 }

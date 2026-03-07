@@ -1,9 +1,11 @@
 use journal::{Journal, JournalRecord, JournalRecordKind};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use storage::lsm_tree::LsmTree;
+use tracing::{error, info};
 
 const NUM_WRITERS: usize = 10;
 const ENTRIES_PER_WRITER: usize = 1500;
@@ -27,13 +29,25 @@ const READER_PROBES: usize = 2000;
 ///   4. Level-1 SSTables (compacted)
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let prometheus_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder");
+
     let tmp_dir = std::env::temp_dir().join(format!("norns-db-example-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir)?;
 
     let data_dir = tmp_dir.join("lsm_data");
     let wal_path = tmp_dir.join("wal.log");
 
-    println!("Data directory: {}", tmp_dir.display());
+    info!(dir = %tmp_dir.display(), "starting norns-db playground");
 
     // -- Initialize the LSM tree and WAL --
     let lsm = Arc::new(LsmTree::<String, String>::new(
@@ -45,9 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let journal: Arc<Journal<String, String>> = Arc::new(Journal::new(&wal_path)?);
 
-    println!(
-        "Starting {NUM_WRITERS} writers x {ENTRIES_PER_WRITER} entries, \
-         {NUM_READERS} concurrent readers x {READER_PROBES} probes\n"
+    info!(
+        writers = NUM_WRITERS,
+        entries_per_writer = ENTRIES_PER_WRITER,
+        readers = NUM_READERS,
+        reader_probes = READER_PROBES,
+        "starting concurrent workload"
     );
 
     let writes_done = Arc::new(AtomicUsize::new(0));
@@ -78,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 writes_done.fetch_add(1, Ordering::Relaxed);
             }
-            println!("[writer-{writer_id}] done ({ENTRIES_PER_WRITER} entries written)");
+            info!(writer_id, entries = ENTRIES_PER_WRITER, "writer done");
         });
         writer_handles.push(handle);
     }
@@ -108,15 +125,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match lsm.get(&key) {
                     Ok(Some(_)) => found += 1,
                     Ok(None) => not_found += 1,
-                    Err(e) => eprintln!("[reader-{reader_id}] error: {e}"),
+                    Err(e) => error!(reader_id, error = %e, "reader error"),
                 }
             }
 
             let total_writes = writes_done.load(Ordering::Relaxed);
-            println!(
-                "[reader-{reader_id}] done — found={found}, not_found={not_found} \
-                 (writes at time of finish: {total_writes}/{})",
-                NUM_WRITERS * ENTRIES_PER_WRITER,
+            info!(
+                reader_id,
+                found,
+                not_found,
+                writes_at_finish = total_writes,
+                total_writes = NUM_WRITERS * ENTRIES_PER_WRITER,
+                "reader done"
             );
         });
         reader_handles.push(handle);
@@ -131,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -- Verify all data is present --
-    println!("\nAll tasks finished. Verifying data integrity...");
+    info!("all tasks finished, verifying data integrity");
 
     let mut verified = 0;
     for writer_id in 0..NUM_WRITERS {
@@ -145,22 +165,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             verified += 1;
         }
     }
-    println!("All {verified} entries verified OK.");
+    info!(verified, "all entries verified OK");
 
     // -- Demonstrate delete through WAL --
-    println!("\nDeleting key_0_0 via WAL...");
+    info!("deleting key_0_0 via WAL");
     let del_record = JournalRecord::new(JournalRecordKind::Delete::<String, String> {
         key: "key_0_0".to_string(),
     });
     journal.append(&del_record).await?;
     lsm.delete("key_0_0".to_string())?;
     assert!(lsm.get(&"key_0_0".to_string())?.is_none());
-    println!("key_0_0 deleted and confirmed absent.");
+    info!("key_0_0 deleted and confirmed absent");
 
     // -- Final flush --
-    println!("\nFlushing remaining memtable to SSTables...");
+    info!("flushing remaining memtable to SSTables");
     lsm.flush()?;
-    println!("Done. WAL file: {}", wal_path.display());
+
+    // -- Print Prometheus metrics --
+    info!("rendering Prometheus metrics");
+    println!("\n{}", prometheus_handle.render());
+
+    info!(wal_path = %wal_path.display(), "done");
 
     // Cleanup
     std::fs::remove_dir_all(&tmp_dir)?;

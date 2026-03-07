@@ -2,6 +2,7 @@
 mod tests;
 
 use crate::{bloom_filter::BloomFilter, io::read_at};
+use metrics::{counter, histogram};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -11,6 +12,7 @@ use std::{
     marker::PhantomData,
     path::Path,
 };
+use tracing::{debug, trace};
 
 pub struct SsTable<K, V> {
     bloom_filter: BloomFilter<K>,
@@ -66,6 +68,14 @@ where
         debug_assert!(!data.is_empty());
 
         let table_path = table_path.as_ref();
+        let entries = data.len();
+        debug!(
+            path = %table_path.display(),
+            entries,
+            block_size,
+            "creating new SSTable"
+        );
+
         let data_file_name = table_path.with_extension("data");
 
         let mut data_writer = BufWriter::new(File::create(&data_file_name)?);
@@ -113,6 +123,15 @@ where
         Self::serialize_on_disk(&block_index, table_path.with_extension("idx"))?;
         Self::serialize_on_disk(&bloom_filter, table_path.with_extension("bloom"))?;
 
+        counter!("sstable.created").increment(1);
+
+        debug!(
+            path = %table_path.display(),
+            entries,
+            blocks = block_index.len(),
+            "SSTable created"
+        );
+
         Ok(Self {
             bloom_filter,
             block_index,
@@ -123,6 +142,8 @@ where
 
     pub fn load(table_path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
         let table_path = table_path.as_ref();
+        debug!(path = %table_path.display(), "loading SSTable");
+
         let block_index = {
             let mut index_reader = BufReader::new(File::open(table_path.with_extension("idx"))?);
             let mut index_buf = Vec::new();
@@ -145,6 +166,10 @@ where
             bloom_filter
         };
 
+        counter!("sstable.loaded").increment(1);
+
+        debug!(path = %table_path.display(), "SSTable loaded");
+
         Ok(Self {
             bloom_filter,
             block_index,
@@ -154,19 +179,26 @@ where
     }
 
     pub fn get(&self, key: &K) -> Result<Option<V>, Box<dyn Error>> {
+        counter!("sstable.lookups").increment(1);
+
         if !self.bloom_filter.contains(key) {
+            counter!("sstable.bloom_filter_rejections").increment(1);
+            debug!("bloom filter rejected lookup");
             return Ok(None);
         }
 
         let Some((_index_key, &BlockIndexEntry { offset, length })) =
             self.block_index.range(..=key).next_back()
         else {
+            debug!("key not found in block index");
             return Ok(None);
         };
 
         // Reading an entire block by index. The item *can* be somewhere in the middle of the block.
+        trace!(offset, length, "reading block for key lookup");
         let mut buf = vec![0u8; length as usize];
         read_at(&self.data_file, &mut buf, offset)?;
+        histogram!("sstable.block_read_bytes").record(length as f64);
 
         let mut cursor_offset = 0usize;
 
@@ -177,6 +209,7 @@ where
             )?;
 
             if &k == key {
+                trace!("key found in SSTable block");
                 return Ok(Some(v));
             }
 
@@ -197,6 +230,8 @@ where
     where
         D: bincode::Encode,
     {
+        let file_name = file_name.as_ref();
+        trace!(path = %file_name.display(), "serializing to disk");
         let serialized = bincode::encode_to_vec(data, bincode::config::standard())?;
         let mut writer = BufWriter::new(File::create(file_name)?);
         writer.write_all(&serialized)?;

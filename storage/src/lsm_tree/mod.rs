@@ -3,6 +3,7 @@ mod tests;
 
 use crate::ss_table::SsTable;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use metrics::{counter, gauge, histogram};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -11,7 +12,9 @@ use std::{
     io::{BufReader, BufWriter, Write},
     path::Path,
     sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    time::Instant,
 };
+use tracing::{debug, info, trace};
 
 pub struct LsmTree<K, V>
 where
@@ -66,8 +69,10 @@ where
     V: Clone + bincode::Encode + bincode::Decode<()>,
 {
     fn drop(&mut self) {
-        let _ = self.flush();
-        // TODO: log this
+        debug!(dir = %self.data_directory, "LSM tree shutting down, flushing memtable");
+        if let Err(e) = self.flush() {
+            debug!(error = %e, "failed to flush memtable on drop");
+        }
     }
 }
 
@@ -90,6 +95,18 @@ where
         std::fs::create_dir_all(Path::new(&data_directory).join("level0"))?;
         std::fs::create_dir_all(Path::new(&data_directory).join("level1"))?;
 
+        debug!(
+            dir = %data_directory,
+            memtable_size,
+            level_0_size,
+            ss_table_block_size,
+            "LSM tree created"
+        );
+
+        gauge!("lsm.memtable_entries").set(0.0);
+        gauge!("lsm.l0_tables").set(0.0);
+        gauge!("lsm.l1_tables").set(0.0);
+
         Ok(Self {
             memtable: RwLock::new(BTreeMap::new()),
             memtable_size,
@@ -106,6 +123,8 @@ where
     }
 
     pub fn load(data_directory: String) -> Result<Self, Box<dyn Error>> {
+        debug!(dir = %data_directory, "loading LSM tree");
+
         let reader = BufReader::new(File::open(Path::new(&data_directory).join("state"))?);
 
         let State {
@@ -116,8 +135,22 @@ where
             level_0_size,
         }: State = bincode::decode_from_reader(reader, bincode::config::standard())?;
 
+        debug!(
+            dir = %data_directory,
+            memtable_size,
+            level_0_size,
+            ss_table_block_size,
+            l0_tables = level_0_ss_tables,
+            l1_tables = level_1_ss_tables,
+            "LSM tree state loaded"
+        );
+
         let level_0_ss_tables = Self::load_level(&data_directory, "level0", level_0_ss_tables)?;
         let level_1_ss_tables = Self::load_level(&data_directory, "level1", level_1_ss_tables)?;
+
+        gauge!("lsm.memtable_entries").set(0.0);
+        gauge!("lsm.l0_tables").set(level_0_ss_tables.len() as f64);
+        gauge!("lsm.l1_tables").set(level_1_ss_tables.len() as f64);
 
         Ok(Self {
             memtable: RwLock::new(BTreeMap::new()),
@@ -161,17 +194,29 @@ where
         };
 
         if needs_flush {
+            debug!("memtable full, triggering flush before insert");
             self.flush()?;
         }
 
-        lock_write(&self.memtable).insert(key, Value::Data(value));
+        trace!("inserting key into memtable");
+        let size = {
+            let mut memtable = lock_write(&self.memtable);
+            memtable.insert(key, Value::Data(value));
+            memtable.len()
+        };
+
+        counter!("lsm.inserts").increment(1);
+        gauge!("lsm.memtable_entries").set(size as f64);
         Ok(())
     }
 
     pub fn get(&self, key: &K) -> Result<Option<V>, Box<dyn Error>> {
+        counter!("lsm.gets").increment(1);
+
         {
             let memtable = lock_read(&self.memtable);
             if let Some(value) = memtable.get(key) {
+                trace!("key found in active memtable");
                 return match value {
                     Value::Data(d) => Ok(Some(d.clone())),
                     Value::Tombstone => Ok(None),
@@ -187,6 +232,7 @@ where
                 .and_then(|frozen_mt| frozen_mt.get(key).cloned());
 
             if let Some(value) = maybe_value {
+                trace!("key found in frozen memtable");
                 return match value {
                     Value::Data(d) => Ok(Some(d)),
                     Value::Tombstone => Ok(None),
@@ -197,10 +243,17 @@ where
         let current_store_version = self.current_store_version.load();
 
         if let Some(value) = self.lookup_in_level(&current_store_version.level_0_ss_tables, key)? {
+            trace!("key found in L0 SSTables");
             return Ok(Some(value));
         }
 
-        self.lookup_in_level(&current_store_version.level_1_ss_tables, key)
+        if let Some(value) = self.lookup_in_level(&current_store_version.level_1_ss_tables, key)? {
+            trace!("key found in L1 SSTables");
+            return Ok(Some(value));
+        }
+
+        trace!("key not found in any level");
+        Ok(None)
     }
 
     fn lookup_in_level(
@@ -223,6 +276,7 @@ where
     pub fn delete(&self, key: K) -> Result<Option<V>, Box<dyn Error>> {
         let value = self.get(&key)?;
         if value.is_none() {
+            debug!("delete: key not found, skipping");
             return Ok(None);
         }
 
@@ -232,10 +286,19 @@ where
         };
 
         if needs_flush {
+            debug!("memtable full, triggering flush before delete");
             self.flush()?;
         }
 
-        lock_write(&self.memtable).insert(key, Value::Tombstone);
+        debug!("writing tombstone for key");
+        let size = {
+            let mut memtable = lock_write(&self.memtable);
+            memtable.insert(key, Value::Tombstone);
+            memtable.len()
+        };
+
+        counter!("lsm.deletes").increment(1);
+        gauge!("lsm.memtable_entries").set(size as f64);
         Ok(value)
     }
 
@@ -245,13 +308,20 @@ where
         let data = {
             let mut memtable = lock_write(&self.memtable);
             if memtable.is_empty() {
+                debug!("flush called but memtable is empty, skipping");
                 return Ok(());
             }
 
+            let size = memtable.len();
+            info!(memtable_entries = size, "flushing memtable to SSTable");
+
             let data = std::mem::take(&mut *memtable);
             self.frozen_memtable.store(Some(Arc::new(data.clone())));
+            gauge!("lsm.memtable_entries").set(0.0);
             data
         };
+
+        let start = Instant::now();
 
         let current_store_version = self.current_store_version.load();
 
@@ -272,7 +342,18 @@ where
 
         self.frozen_memtable.store(None);
 
+        counter!("lsm.flushes").increment(1);
+        histogram!("lsm.flush_duration_seconds").record(start.elapsed().as_secs_f64());
+        gauge!("lsm.l0_tables")
+            .set(self.current_store_version.load().level_0_ss_tables.len() as f64);
+
+        info!("memtable flushed to L0 SSTable");
+
         if needs_compaction {
+            debug!(
+                l0_tables = self.level_0_size,
+                "L0 full, triggering compaction"
+            );
             self.compact_inner()?;
         }
 
@@ -289,6 +370,11 @@ where
     /// Must be called with store_lock held.
     fn compact_inner(&self) -> Result<(), Box<dyn Error>> {
         let current = self.current_store_version.load();
+
+        let l0_count = current.level_0_ss_tables.len();
+        info!(l0_tables = l0_count, "starting L0 -> L1 compaction");
+
+        let start = Instant::now();
 
         let iters = current
             .level_0_ss_tables
@@ -318,6 +404,7 @@ where
         for file in std::fs::read_dir(level_0)? {
             let file = file?;
             let path = file.path();
+            trace!(path = %path.display(), "removing old L0 file");
             std::fs::remove_file(path)?;
         }
 
@@ -330,6 +417,19 @@ where
         }));
 
         self.save_state()?;
+
+        counter!("lsm.compactions").increment(1);
+        histogram!("lsm.compaction_duration_seconds").record(start.elapsed().as_secs_f64());
+
+        let store = self.current_store_version.load();
+        gauge!("lsm.l0_tables").set(store.level_0_ss_tables.len() as f64);
+        gauge!("lsm.l1_tables").set(store.level_1_ss_tables.len() as f64);
+
+        info!(
+            l0_compacted = l0_count,
+            l1_tables = store.level_1_ss_tables.len(),
+            "compaction complete"
+        );
 
         Ok(())
     }
@@ -347,6 +447,12 @@ where
             level_1_ss_tables: current_store_version.level_1_ss_tables.len(),
             level_0_size: self.level_0_size,
         };
+
+        debug!(
+            l0_tables = state.level_0_ss_tables,
+            l1_tables = state.level_1_ss_tables,
+            "saving LSM tree state"
+        );
 
         let encoded_state = bincode::encode_to_vec(state, bincode::config::standard())?;
 
