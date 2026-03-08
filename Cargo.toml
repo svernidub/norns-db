@@ -19,3 +19,9 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", features = ["http-listener"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "metrics", "logs", "internal-logs"] }
+opentelemetry-appender-tracing = "0.31"
+tracing-opentelemetry = "0.32"
+metrics-exporter-opentelemetry = "0.2"

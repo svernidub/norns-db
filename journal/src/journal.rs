@@ -1,12 +1,10 @@
 use crate::journal_record::JournalRecord;
 use dbcore::error::NornsDbError;
-use metrics::{counter, histogram};
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
-    time::Instant,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, trace};
@@ -105,8 +103,7 @@ impl<K, V> Journal<K, V> {
 
         trace!(payload_len = len, checksum, "writing journal record");
 
-        let start = Instant::now();
-        let result = writer
+        writer
             .write_all(&len.to_le_bytes())
             .and_then(|_| writer.write_all(payload))
             .and_then(|_| writer.write_all(&checksum.to_le_bytes()))
@@ -115,15 +112,6 @@ impl<K, V> Journal<K, V> {
             .map_err(|e| {
                 error!(error = %e, "failed to write journal record to disk");
                 NornsDbError::unknown_with_message(e, "Failed to write journal record")
-            });
-
-        histogram!("journal.write_duration_seconds").record(start.elapsed().as_secs_f64());
-
-        if result.is_ok() {
-            counter!("journal.records_written").increment(1);
-            histogram!("journal.record_bytes").record(len as f64);
-        }
-
-        result
+            })
     }
 }

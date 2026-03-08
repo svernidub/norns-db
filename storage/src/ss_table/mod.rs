@@ -2,7 +2,6 @@
 mod tests;
 
 use crate::{bloom_filter::BloomFilter, io::read_at};
-use metrics::{counter, histogram};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -123,8 +122,6 @@ where
         Self::serialize_on_disk(&block_index, table_path.with_extension("idx"))?;
         Self::serialize_on_disk(&bloom_filter, table_path.with_extension("bloom"))?;
 
-        counter!("sstable.created").increment(1);
-
         debug!(
             path = %table_path.display(),
             entries,
@@ -166,8 +163,6 @@ where
             bloom_filter
         };
 
-        counter!("sstable.loaded").increment(1);
-
         debug!(path = %table_path.display(), "SSTable loaded");
 
         Ok(Self {
@@ -179,10 +174,7 @@ where
     }
 
     pub fn get(&self, key: &K) -> Result<Option<V>, Box<dyn Error>> {
-        counter!("sstable.lookups").increment(1);
-
         if !self.bloom_filter.contains(key) {
-            counter!("sstable.bloom_filter_rejections").increment(1);
             debug!("bloom filter rejected lookup");
             return Ok(None);
         }
@@ -198,7 +190,6 @@ where
         trace!(offset, length, "reading block for key lookup");
         let mut buf = vec![0u8; length as usize];
         read_at(&self.data_file, &mut buf, offset)?;
-        histogram!("sstable.block_read_bytes").record(length as f64);
 
         let mut cursor_offset = 0usize;
 

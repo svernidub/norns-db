@@ -3,7 +3,7 @@ mod tests;
 
 use crate::ss_table::SsTable;
 use arc_swap::{ArcSwap, ArcSwapOption};
-use metrics::{counter, gauge, histogram};
+use metrics::{gauge, histogram};
 use std::{
     collections::BTreeMap,
     error::Error,
@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::Instant,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, instrument, trace};
 
 pub struct LsmTree<K, V>
 where
@@ -103,9 +103,8 @@ where
             "LSM tree created"
         );
 
-        gauge!("lsm.memtable_entries").set(0.0);
-        gauge!("lsm.l0_tables").set(0.0);
-        gauge!("lsm.l1_tables").set(0.0);
+        gauge!("lsm_l0_tables").set(0.0);
+        gauge!("lsm_l1_tables").set(0.0);
 
         Ok(Self {
             memtable: RwLock::new(BTreeMap::new()),
@@ -148,9 +147,8 @@ where
         let level_0_ss_tables = Self::load_level(&data_directory, "level0", level_0_ss_tables)?;
         let level_1_ss_tables = Self::load_level(&data_directory, "level1", level_1_ss_tables)?;
 
-        gauge!("lsm.memtable_entries").set(0.0);
-        gauge!("lsm.l0_tables").set(level_0_ss_tables.len() as f64);
-        gauge!("lsm.l1_tables").set(level_1_ss_tables.len() as f64);
+        gauge!("lsm_l0_tables").set(level_0_ss_tables.len() as f64);
+        gauge!("lsm_l1_tables").set(level_1_ss_tables.len() as f64);
 
         Ok(Self {
             memtable: RwLock::new(BTreeMap::new()),
@@ -187,7 +185,10 @@ where
         Ok(level_ss_tables)
     }
 
+    #[instrument(skip(self, key, value))]
     pub fn insert(&self, key: K, value: V) -> Result<(), Box<dyn Error>> {
+        let start = Instant::now();
+
         let needs_flush = {
             let memtable = lock_read(&self.memtable);
             memtable.len() >= self.memtable_size
@@ -199,61 +200,70 @@ where
         }
 
         trace!("inserting key into memtable");
-        let size = {
+        let _size = {
             let mut memtable = lock_write(&self.memtable);
             memtable.insert(key, Value::Data(value));
             memtable.len()
         };
 
-        counter!("lsm.inserts").increment(1);
-        gauge!("lsm.memtable_entries").set(size as f64);
+        histogram!("lsm_insert_duration_microseconds").record(start.elapsed().as_micros() as f64);
         Ok(())
     }
 
+    #[instrument(skip(self, key))]
     pub fn get(&self, key: &K) -> Result<Option<V>, Box<dyn Error>> {
-        counter!("lsm.gets").increment(1);
+        let start = Instant::now();
 
-        {
-            let memtable = lock_read(&self.memtable);
-            if let Some(value) = memtable.get(key) {
-                trace!("key found in active memtable");
-                return match value {
-                    Value::Data(d) => Ok(Some(d.clone())),
-                    Value::Tombstone => Ok(None),
-                };
+        let result = (|| {
+            {
+                let memtable = lock_read(&self.memtable);
+                if let Some(value) = memtable.get(key) {
+                    trace!("key found in active memtable");
+                    return match value {
+                        Value::Data(d) => Ok(Some(d.clone())),
+                        Value::Tombstone => Ok(None),
+                    };
+                }
             }
-        }
 
-        {
-            let frozen_memtable = self.frozen_memtable.load();
+            {
+                let frozen_memtable = self.frozen_memtable.load();
 
-            let maybe_value = frozen_memtable
-                .as_ref()
-                .and_then(|frozen_mt| frozen_mt.get(key).cloned());
+                let maybe_value = frozen_memtable
+                    .as_ref()
+                    .and_then(|frozen_mt| frozen_mt.get(key).cloned());
 
-            if let Some(value) = maybe_value {
-                trace!("key found in frozen memtable");
-                return match value {
-                    Value::Data(d) => Ok(Some(d)),
-                    Value::Tombstone => Ok(None),
-                };
+                if let Some(value) = maybe_value {
+                    trace!("key found in frozen memtable");
+                    return match value {
+                        Value::Data(d) => Ok(Some(d)),
+                        Value::Tombstone => Ok(None),
+                    };
+                }
             }
-        }
 
-        let current_store_version = self.current_store_version.load();
+            let current_store_version = self.current_store_version.load();
 
-        if let Some(value) = self.lookup_in_level(&current_store_version.level_0_ss_tables, key)? {
-            trace!("key found in L0 SSTables");
-            return Ok(Some(value));
-        }
+            if let Some(value) =
+                self.lookup_in_level(&current_store_version.level_0_ss_tables, key)?
+            {
+                trace!("key found in L0 SSTables");
+                return Ok(Some(value));
+            }
 
-        if let Some(value) = self.lookup_in_level(&current_store_version.level_1_ss_tables, key)? {
-            trace!("key found in L1 SSTables");
-            return Ok(Some(value));
-        }
+            if let Some(value) =
+                self.lookup_in_level(&current_store_version.level_1_ss_tables, key)?
+            {
+                trace!("key found in L1 SSTables");
+                return Ok(Some(value));
+            }
 
-        trace!("key not found in any level");
-        Ok(None)
+            trace!("key not found in any level");
+            Ok(None)
+        })();
+
+        histogram!("lsm_get_duration_microseconds").record(start.elapsed().as_micros() as f64);
+        result
     }
 
     fn lookup_in_level(
@@ -291,14 +301,9 @@ where
         }
 
         debug!("writing tombstone for key");
-        let size = {
-            let mut memtable = lock_write(&self.memtable);
-            memtable.insert(key, Value::Tombstone);
-            memtable.len()
-        };
+        let mut memtable = lock_write(&self.memtable);
+        memtable.insert(key, Value::Tombstone);
 
-        counter!("lsm.deletes").increment(1);
-        gauge!("lsm.memtable_entries").set(size as f64);
         Ok(value)
     }
 
@@ -312,12 +317,10 @@ where
                 return Ok(());
             }
 
-            let size = memtable.len();
-            info!(memtable_entries = size, "flushing memtable to SSTable");
+            info!("flushing memtable to SSTable");
 
             let data = std::mem::take(&mut *memtable);
             self.frozen_memtable.store(Some(Arc::new(data.clone())));
-            gauge!("lsm.memtable_entries").set(0.0);
             data
         };
 
@@ -342,9 +345,8 @@ where
 
         self.frozen_memtable.store(None);
 
-        counter!("lsm.flushes").increment(1);
-        histogram!("lsm.flush_duration_seconds").record(start.elapsed().as_secs_f64());
-        gauge!("lsm.l0_tables")
+        histogram!("lsm_flush_duration_seconds").record(start.elapsed().as_secs_f64());
+        gauge!("lsm_l0_tables")
             .set(self.current_store_version.load().level_0_ss_tables.len() as f64);
 
         info!("memtable flushed to L0 SSTable");
@@ -418,12 +420,11 @@ where
 
         self.save_state()?;
 
-        counter!("lsm.compactions").increment(1);
-        histogram!("lsm.compaction_duration_seconds").record(start.elapsed().as_secs_f64());
+        histogram!("lsm_l0_compaction_duration_seconds").record(start.elapsed().as_secs_f64());
 
         let store = self.current_store_version.load();
-        gauge!("lsm.l0_tables").set(store.level_0_ss_tables.len() as f64);
-        gauge!("lsm.l1_tables").set(store.level_1_ss_tables.len() as f64);
+        gauge!("lsm_l0_tables").set(store.level_0_ss_tables.len() as f64);
+        gauge!("lsm_l1_tables").set(store.level_1_ss_tables.len() as f64);
 
         info!(
             l0_compacted = l0_count,

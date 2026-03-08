@@ -9,6 +9,11 @@ journal = { path = "../journal" }
 storage = { path = "../storage" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
-metrics-exporter-prometheus = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+metrics-exporter-opentelemetry = { workspace = true }
