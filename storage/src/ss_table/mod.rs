@@ -2,9 +2,9 @@
 mod tests;
 
 use crate::{bloom_filter::BloomFilter, io::read_at};
+use dbcore::error::NornsDbError;
 use std::{
     collections::BTreeMap,
-    error::Error,
     fs::File,
     hash::Hash,
     io::{BufReader, BufWriter, Read, Seek, Write},
@@ -36,7 +36,7 @@ where
     K: bincode::Decode<()>,
     V: bincode::Decode<()>,
 {
-    type Item = Result<(K, V), Box<dyn Error>>;
+    type Item = Result<(K, V), NornsDbError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = bincode::decode_from_reader::<(K, V), _, _>(
@@ -49,7 +49,7 @@ where
             Err(e) if matches!(&e, bincode::error::DecodeError::Io { inner, .. } if inner.kind() == std::io::ErrorKind::UnexpectedEof) => {
                 None
             }
-            Err(e) => Some(Err(Box::new(e))),
+            Err(e) => Some(Err(e.into())),
         }
     }
 }
@@ -63,7 +63,7 @@ where
         data: BTreeMap<K, V>,
         table_path: impl AsRef<Path>,
         block_size: usize,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, NornsDbError> {
         debug_assert!(!data.is_empty());
 
         let table_path = table_path.as_ref();
@@ -137,7 +137,7 @@ where
         })
     }
 
-    pub fn load(table_path: impl AsRef<Path>) -> Result<Self, Box<dyn Error>> {
+    pub fn load(table_path: impl AsRef<Path>) -> Result<Self, NornsDbError> {
         let table_path = table_path.as_ref();
         debug!(path = %table_path.display(), "loading SSTable");
 
@@ -173,7 +173,7 @@ where
         })
     }
 
-    pub fn get(&self, key: &K) -> Result<Option<V>, Box<dyn Error>> {
+    pub fn get(&self, key: &K) -> Result<Option<V>, NornsDbError> {
         if !self.bloom_filter.contains(key) {
             debug!("bloom filter rejected lookup");
             return Ok(None);
@@ -210,14 +210,14 @@ where
         Ok(None)
     }
 
-    pub fn iter(&self) -> Result<SsTableIter<K, V>, Box<dyn Error>> {
+    pub fn iter(&self) -> Result<SsTableIter<K, V>, NornsDbError> {
         Ok(SsTableIter {
             reader: BufReader::new(self.data_file.try_clone()?),
             phantom_data: Default::default(),
         })
     }
 
-    fn serialize_on_disk<D>(data: &D, file_name: impl AsRef<Path>) -> Result<(), Box<dyn Error>>
+    fn serialize_on_disk<D>(data: &D, file_name: impl AsRef<Path>) -> Result<(), NornsDbError>
     where
         D: bincode::Encode,
     {

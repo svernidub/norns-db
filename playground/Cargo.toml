@@ -5,8 +5,8 @@ edition.workspace = true
 description = "Vibecoded and manual scripts for kinda testing things in integration"
 
 [dependencies]
-journal = { path = "../journal" }
-storage = { path = "../storage" }
+engine = { path = "../engine" }
+dbcore = { workspace = true }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tracing = { workspace = true }

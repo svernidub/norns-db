@@ -3,14 +3,14 @@ mod tests;
 
 use crate::ss_table::SsTable;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use dbcore::error::NornsDbError;
 use metrics::{gauge, histogram};
 use std::{
     collections::BTreeMap,
-    error::Error,
     fs::File,
     hash::Hash,
     io::{BufReader, BufWriter, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::Instant,
 };
@@ -23,7 +23,7 @@ where
 {
     memtable: RwLock<BTreeMap<K, Value<V>>>,
     memtable_size: usize,
-    data_directory: String,
+    data_directory: PathBuf,
     ss_table_block_size: usize,
     level_0_size: usize,
 
@@ -69,7 +69,7 @@ where
     V: Clone + bincode::Encode + bincode::Decode<()>,
 {
     fn drop(&mut self) {
-        debug!(dir = %self.data_directory, "LSM tree shutting down, flushing memtable");
+        debug!(dir = %self.data_directory.display(), "LSM tree shutting down, flushing memtable");
         if let Err(e) = self.flush() {
             debug!(error = %e, "failed to flush memtable on drop");
         }
@@ -82,21 +82,24 @@ where
     V: Clone + bincode::Encode + bincode::Decode<()>,
 {
     pub fn new(
-        data_directory: String,
+        data_directory: impl Into<PathBuf>,
         memtable_size: usize,
         level_0_size: usize,
         ss_table_block_size: usize,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, NornsDbError> {
+        let data_directory = data_directory.into();
+
         assert!(
-            !std::fs::exists(Path::new(&data_directory).join("state"))?,
-            "LSM tree already initialized at {data_directory}, use load() instead"
+            !std::fs::exists(data_directory.join("state"))?,
+            "LSM tree already initialized at {}, use load() instead",
+            data_directory.display()
         );
 
-        std::fs::create_dir_all(Path::new(&data_directory).join("level0"))?;
-        std::fs::create_dir_all(Path::new(&data_directory).join("level1"))?;
+        std::fs::create_dir_all(data_directory.join("level0"))?;
+        std::fs::create_dir_all(data_directory.join("level1"))?;
 
         debug!(
-            dir = %data_directory,
+            dir = %data_directory.display(),
             memtable_size,
             level_0_size,
             ss_table_block_size,
@@ -121,10 +124,11 @@ where
         })
     }
 
-    pub fn load(data_directory: String) -> Result<Self, Box<dyn Error>> {
-        debug!(dir = %data_directory, "loading LSM tree");
+    pub fn load(data_directory: impl Into<PathBuf>) -> Result<Self, NornsDbError> {
+        let data_directory = data_directory.into();
+        debug!(dir = %data_directory.display(), "loading LSM tree");
 
-        let reader = BufReader::new(File::open(Path::new(&data_directory).join("state"))?);
+        let reader = BufReader::new(File::open(data_directory.join("state"))?);
 
         let State {
             ss_table_block_size,
@@ -135,7 +139,7 @@ where
         }: State = bincode::decode_from_reader(reader, bincode::config::standard())?;
 
         debug!(
-            dir = %data_directory,
+            dir = %data_directory.display(),
             memtable_size,
             level_0_size,
             ss_table_block_size,
@@ -168,16 +172,14 @@ where
     // FIXME: deal with this later
     #[allow(clippy::type_complexity)]
     fn load_level(
-        data_directory: &str,
+        data_directory: &Path,
         level_name: &str,
         tables_number: usize,
-    ) -> Result<Vec<Arc<SsTable<K, Value<V>>>>, Box<dyn Error>> {
+    ) -> Result<Vec<Arc<SsTable<K, Value<V>>>>, NornsDbError> {
         let mut level_ss_tables = Vec::with_capacity(tables_number);
 
         for ss_table in 0..tables_number {
-            let path = Path::new(data_directory)
-                .join(level_name)
-                .join(ss_table.to_string());
+            let path = data_directory.join(level_name).join(ss_table.to_string());
 
             let table = Arc::new(SsTable::<K, Value<V>>::load(path)?);
             level_ss_tables.push(table);
@@ -186,7 +188,7 @@ where
     }
 
     #[instrument(skip(self, key, value))]
-    pub fn insert(&self, key: K, value: V) -> Result<(), Box<dyn Error>> {
+    pub fn insert(&self, key: K, value: V) -> Result<(), NornsDbError> {
         let start = Instant::now();
 
         let needs_flush = {
@@ -211,7 +213,7 @@ where
     }
 
     #[instrument(skip(self, key))]
-    pub fn get(&self, key: &K) -> Result<Option<V>, Box<dyn Error>> {
+    pub fn get(&self, key: &K) -> Result<Option<V>, NornsDbError> {
         let start = Instant::now();
 
         let result = (|| {
@@ -270,7 +272,7 @@ where
         &self,
         level: &[Arc<SsTable<K, Value<V>>>],
         key: &K,
-    ) -> Result<Option<V>, Box<dyn Error>> {
+    ) -> Result<Option<V>, NornsDbError> {
         for ss_table in level.iter().rev() {
             if let Some(value) = ss_table.get(key)? {
                 return match value {
@@ -283,7 +285,7 @@ where
         Ok(None)
     }
 
-    pub fn delete(&self, key: K) -> Result<Option<V>, Box<dyn Error>> {
+    pub fn delete(&self, key: K) -> Result<Option<V>, NornsDbError> {
         let value = self.get(&key)?;
         if value.is_none() {
             debug!("delete: key not found, skipping");
@@ -307,7 +309,7 @@ where
         Ok(value)
     }
 
-    pub fn flush(&self) -> Result<(), Box<dyn Error>> {
+    pub fn flush(&self) -> Result<(), NornsDbError> {
         let _guard = self.store_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let data = {
@@ -328,9 +330,11 @@ where
 
         let current_store_version = self.current_store_version.load();
 
-        let path = Path::new(&self.data_directory)
+        let path = self
+            .data_directory
             .join("level0")
             .join(current_store_version.level_0_ss_tables.len().to_string());
+
         let new_table = SsTable::new(data, &path, self.ss_table_block_size)?;
 
         let mut new_level_0_ss_tables = current_store_version.level_0_ss_tables.clone();
@@ -363,14 +367,14 @@ where
         Ok(())
     }
 
-    pub fn compact(&self) -> Result<(), Box<dyn Error>> {
+    pub fn compact(&self) -> Result<(), NornsDbError> {
         let _guard = self.store_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         self.compact_inner()
     }
 
     /// Must be called with store_lock held.
-    fn compact_inner(&self) -> Result<(), Box<dyn Error>> {
+    fn compact_inner(&self) -> Result<(), NornsDbError> {
         let current = self.current_store_version.load();
 
         let l0_count = current.level_0_ss_tables.len();
@@ -395,13 +399,14 @@ where
         //       values on level 1 before. Need to find a way to cleanup Tombstones without a
         //       corresponding values on deeper levels.
 
-        let path = Path::new(&self.data_directory)
+        let path = self
+            .data_directory
             .join("level1")
             .join(current.level_1_ss_tables.len().to_string());
 
         let new_lower_level_table = SsTable::new(compacted_level, &path, self.ss_table_block_size)?;
 
-        let level_0 = Path::new(&self.data_directory).join("level0");
+        let level_0 = self.data_directory.join("level0");
 
         for file in std::fs::read_dir(level_0)? {
             let file = file?;
@@ -435,9 +440,20 @@ where
         Ok(())
     }
 
-    fn save_state(&self) -> Result<(), Box<dyn Error>> {
-        let mut writer =
-            BufWriter::new(File::create(Path::new(&self.data_directory).join("state"))?);
+    pub fn destroy(self) -> Result<(), NornsDbError> {
+        // Prevent from flushing memtable to a disk.
+        {
+            lock_write(&self.memtable).clear();
+        }
+
+        let dir = self.data_directory.clone();
+        drop(self);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    fn save_state(&self) -> Result<(), NornsDbError> {
+        let mut writer = BufWriter::new(File::create(self.data_directory.join("state"))?);
 
         let current_store_version = self.current_store_version.load();
 

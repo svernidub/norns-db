@@ -1,11 +1,15 @@
-use journal::{Journal, JournalRecord, JournalRecordKind};
+use engine::{
+    Database, DatabaseConfig, TableSchema,
+    column::{Column, ColumnType},
+    primary_key::{PrimaryKey, PrimaryKeyType},
+    row::Row,
+};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use storage::lsm_tree::LsmTree;
 use tracing::{error, info, instrument};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -14,60 +18,46 @@ const ENTRIES_PER_WRITER: usize = 15000;
 const NUM_READERS: usize = 4;
 const READER_PROBES: usize = 2000;
 
-/// Demonstrates WAL + LSM tree working together with concurrent reads and writes.
+/// Demonstrates the Database API with concurrent reads and writes.
 ///
-/// The write path:
-///   1. Encode the operation as a JournalRecord
-///   2. Append to WAL (fsync) — this is the durability guarantee
+/// The write path (handled internally by Database → Table → Journal + LsmTree):
+///   1. Validate key/row against the table schema
+///   2. Append to WAL (fsync) — durability guarantee
 ///   3. Insert into the LSM tree memtable — fast, in-memory
-///
-/// On crash recovery (not shown here), you'd replay the WAL to rebuild the memtable
-/// for any entries that weren't flushed to SSTables yet.
 ///
 /// The read path hits (in order):
 ///   1. Active memtable (in-memory BTreeMap)
 ///   2. Frozen memtable (if a flush is in progress)
 ///   3. Level-0 SSTables (most recent first)
 ///   4. Level-1 SSTables (compacted)
-#[instrument(skip(lsm, journal, writes_done))]
-async fn writer_task(
-    writer_id: usize,
-    lsm: Arc<LsmTree<String, String>>,
-    journal: Arc<Journal<String, String>>,
-    writes_done: Arc<AtomicUsize>,
-) {
+#[instrument(skip(db, writes_done))]
+async fn writer_task(writer_id: usize, db: Arc<Database>, writes_done: Arc<AtomicUsize>) {
     for i in 0..ENTRIES_PER_WRITER {
-        let key = format!("key_{writer_id}_{i}");
-        let value = format!("value_{writer_id}_{i}");
+        let key = PrimaryKey::Varchar(format!("key_{writer_id}_{i}"));
+        let row = Row(vec![Column::Varchar(format!("value_{writer_id}_{i}"))]);
 
-        let record = JournalRecord::new(JournalRecordKind::Upsert {
-            key: key.clone(),
-            value: value.clone(),
-        });
-        journal.append(&record).await.expect("WAL append failed");
-
-        lsm.insert(key, value).expect("LSM insert failed");
+        db.insert("entries", key, row).await.expect("insert failed");
 
         writes_done.fetch_add(1, Ordering::Relaxed);
     }
     info!(writer_id, entries = ENTRIES_PER_WRITER, "writer done");
 }
 
-#[instrument(skip(lsm, writes_done))]
-fn reader_task(reader_id: usize, lsm: Arc<LsmTree<String, String>>, writes_done: Arc<AtomicUsize>) {
+#[instrument(skip(db, writes_done))]
+async fn reader_task(reader_id: usize, db: Arc<Database>, writes_done: Arc<AtomicUsize>) {
+    while writes_done.load(Ordering::Relaxed) == 0 {
+        tokio::task::yield_now().await;
+    }
+
     let mut found = 0;
     let mut not_found = 0;
-
-    while writes_done.load(Ordering::Relaxed) == 0 {
-        std::thread::yield_now();
-    }
 
     for probe in 0..READER_PROBES {
         let writer_id = probe % NUM_WRITERS;
         let key_id = probe % ENTRIES_PER_WRITER;
-        let key = format!("key_{writer_id}_{key_id}");
+        let key = PrimaryKey::Varchar(format!("key_{writer_id}_{key_id}"));
 
-        match lsm.get(&key) {
+        match db.get("entries", &key).await {
             Ok(Some(_)) => found += 1,
             Ok(None) => not_found += 1,
             Err(e) => error!(reader_id, error = %e, "reader error"),
@@ -88,22 +78,23 @@ fn reader_task(reader_id: usize, lsm: Arc<LsmTree<String, String>>, writes_done:
 #[instrument]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tmp_dir = std::env::temp_dir().join(format!("norns-db-example-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir)?;
-
-    let data_dir = tmp_dir.join("lsm_data");
-    let wal_path = tmp_dir.join("wal.log");
 
     info!(dir = %tmp_dir.display(), "starting norns-db playground");
 
-    // -- Initialize the LSM tree and WAL --
-    let lsm = Arc::new(LsmTree::<String, String>::new(
-        data_dir.to_string_lossy().to_string(),
-        10000, // memtable_size: flush to SSTable every 100 entries
-        15,    // level_0_size: compact after 4 L0 SSTables
-        4096,  // ss_table_block_size
-    )?);
+    let config = DatabaseConfig {
+        memtable_size: 10000,
+        level_0_size: 15,
+        ss_table_block_size: 4096,
+    };
 
-    let journal: Arc<Journal<String, String>> = Arc::new(Journal::new(&wal_path)?);
+    let db = Arc::new(Database::new(&tmp_dir, config)?);
+
+    let schema = TableSchema {
+        primary_key_name: "key".to_string(),
+        primary_key_type: PrimaryKeyType::Varchar,
+        columns: vec![("value".to_string(), ColumnType::Varchar)],
+    };
+    db.create_table("entries", schema).await?;
 
     info!(
         writers = NUM_WRITERS,
@@ -116,28 +107,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let writes_done = Arc::new(AtomicUsize::new(0));
 
     // -- Spawn concurrent writers --
-    // Each writer owns a range of keys and follows the WAL-first protocol.
     let mut writer_handles = vec![];
     for writer_id in 0..NUM_WRITERS {
-        let lsm = lsm.clone();
-        let journal = journal.clone();
+        let db = db.clone();
         let writes_done = writes_done.clone();
-
-        let handle = tokio::spawn(writer_task(writer_id, lsm, journal, writes_done));
+        let handle = tokio::spawn(writer_task(writer_id, db, writes_done));
         writer_handles.push(handle);
     }
 
     // -- Spawn concurrent readers --
-    // Readers probe random keys while writers are still active.
-    // Some probes will miss (key not yet written) — that's expected.
     let mut reader_handles = vec![];
     for reader_id in 0..NUM_READERS {
-        let lsm = lsm.clone();
+        let db = db.clone();
         let writes_done = writes_done.clone();
-
-        let handle = tokio::task::spawn_blocking(move || {
-            reader_task(reader_id, lsm, writes_done);
-        });
+        let handle = tokio::spawn(reader_task(reader_id, db, writes_done));
         reader_handles.push(handle);
     }
 
@@ -155,35 +138,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut verified = 0;
     for writer_id in 0..NUM_WRITERS {
         for i in 0..ENTRIES_PER_WRITER {
-            let key = format!("key_{writer_id}_{i}");
+            let key = PrimaryKey::Varchar(format!("key_{writer_id}_{i}"));
             let expected = format!("value_{writer_id}_{i}");
-            let actual = lsm
-                .get(&key)?
-                .unwrap_or_else(|| panic!("missing key: {key}"));
-            assert_eq!(actual, expected, "mismatch for {key}");
+
+            let row = db
+                .get("entries", &key)
+                .await?
+                .unwrap_or_else(|| panic!("missing key: key_{writer_id}_{i}"));
+
+            match &row.0[0] {
+                Column::Varchar(v) => assert_eq!(v, &expected, "mismatch for key_{writer_id}_{i}"),
+                other => panic!("unexpected column type: {other:?}"),
+            }
             verified += 1;
         }
     }
     info!(verified, "all entries verified OK");
 
-    // -- Demonstrate delete through WAL --
-    info!("deleting key_0_0 via WAL");
-    let del_record = JournalRecord::new(JournalRecordKind::Delete::<String, String> {
-        key: "key_0_0".to_string(),
-    });
-    journal.append(&del_record).await?;
-    lsm.delete("key_0_0".to_string())?;
-    assert!(lsm.get(&"key_0_0".to_string())?.is_none());
+    // -- Demonstrate delete --
+    let del_key = PrimaryKey::Varchar("key_0_0".to_string());
+    info!("deleting key_0_0");
+    db.delete("entries", del_key.clone()).await?;
+    assert!(db.get("entries", &del_key).await?.is_none());
     info!("key_0_0 deleted and confirmed absent");
 
-    // -- Final flush --
-    info!("flushing remaining memtable to SSTables");
-    lsm.flush()?;
+    // -- Demonstrate drop table --
+    info!("dropping table 'entries'");
+    db.drop_table("entries").await?;
 
-    info!(wal_path = %wal_path.display(), "done");
+    let names = db.table_names().await;
+    assert!(names.is_empty());
+    info!("table dropped, database is empty");
 
-    // Cleanup
-    std::fs::remove_dir_all(&tmp_dir)?;
+    // -- Cleanup --
+    let db = Arc::into_inner(db).expect("outstanding Arc references to Database");
+    db.destroy().await?;
+    info!("database destroyed");
 
     Ok(())
 }

@@ -1,13 +1,12 @@
 [package]
-name = "storage"
+name = "engine"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 dbcore = { workspace = true }
+journal = { workspace = true }
+storage = { workspace = true }
 
-arc-swap = "1.8.2"
 bincode = { workspace = true }
-metrics = { workspace = true }
-siphasher = { workspace = true }
-tracing = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

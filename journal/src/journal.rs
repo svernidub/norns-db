@@ -11,6 +11,7 @@ use tracing::{debug, error, trace};
 
 pub struct Journal<K, V> {
     sender: mpsc::Sender<WriteRequest>,
+    writer_handle: tokio::task::JoinHandle<()>,
     #[allow(dead_code)]
     path: PathBuf,
     _marker: PhantomData<(K, V)>,
@@ -29,16 +30,15 @@ impl<K, V> Journal<K, V> {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|e| {
+            .inspect_err(|e| {
                 error!(path = %path.display(), error = %e, "failed to open journal file");
-                NornsDbError::unknown_with_message(e, "Failed to open journal file")
             })?;
 
         // TODO: make configurable?
         let (sender, receiver) = mpsc::channel(256);
 
         let writer_path = path.clone();
-        tokio::task::spawn_blocking(move || {
+        let writer_handle = tokio::task::spawn_blocking(move || {
             Self::run_writer_loop(file, receiver, &writer_path);
         });
 
@@ -46,6 +46,7 @@ impl<K, V> Journal<K, V> {
 
         Ok(Self {
             sender,
+            writer_handle,
             path,
             _marker: PhantomData,
         })
@@ -56,10 +57,10 @@ impl<K, V> Journal<K, V> {
         K: bincode::Encode,
         V: bincode::Encode,
     {
-        let payload = bincode::encode_to_vec(record, bincode::config::standard()).map_err(|e| {
-            error!(error = %e, "failed to encode journal record");
-            NornsDbError::unknown_with_message(e, "Failed to encode journal record")
-        })?;
+        let payload =
+            bincode::encode_to_vec(record, bincode::config::standard()).inspect_err(|e| {
+                error!(error = %e, "failed to encode journal record");
+            })?;
 
         let (done_tx, done_rx) = oneshot::channel::<Result<(), NornsDbError>>();
 
@@ -73,13 +74,31 @@ impl<K, V> Journal<K, V> {
             .await
             .map_err(|e| {
                 error!(error = %e, "failed to send journal record to writer");
-                NornsDbError::unknown_with_message(e, "Failed to send journal record")
+                NornsDbError::internal(e, "failed to send journal record")
             })?;
 
         done_rx.await.map_err(|e| {
             error!(error = %e, "journal writer dropped without responding");
-            NornsDbError::unknown_with_message(e, "Failed to process journal record")
+            NornsDbError::internal(e, "failed to process journal record")
         })?
+    }
+
+    pub async fn shutdown(self) -> Result<(), NornsDbError> {
+        let Self {
+            sender,
+            writer_handle,
+            path,
+            _marker,
+        } = self;
+        // Drop the sender so the writer loop exits
+        drop(sender);
+
+        writer_handle
+            .await
+            .map_err(|e| NornsDbError::internal(e, "journal writer task panicked"))?;
+
+        debug!(path = %path.display(), "journal shut down");
+        Ok(())
     }
 
     fn run_writer_loop(file: File, mut receiver: mpsc::Receiver<WriteRequest>, path: &Path) {
@@ -109,9 +128,10 @@ impl<K, V> Journal<K, V> {
             .and_then(|_| writer.write_all(&checksum.to_le_bytes()))
             .and_then(|_| writer.flush())
             .and_then(|_| writer.get_mut().sync_all())
-            .map_err(|e| {
+            .inspect_err(|e| {
                 error!(error = %e, "failed to write journal record to disk");
-                NornsDbError::unknown_with_message(e, "Failed to write journal record")
-            })
+            })?;
+
+        Ok(())
     }
 }
