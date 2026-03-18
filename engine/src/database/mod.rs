@@ -7,7 +7,13 @@ use crate::{
     table::{Table, TableConfig, TableSchema},
 };
 use dbcore::error::NornsDbError;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 
 pub struct Database {
@@ -22,6 +28,7 @@ pub struct Database {
     config: DatabaseConfig,
 }
 
+#[derive(bincode::Encode, bincode::Decode)]
 pub struct DatabaseSchema {
     pub tables: HashMap<String, TableSchema>,
 }
@@ -57,19 +64,22 @@ impl Database {
         let data_directory = data_directory.into();
         std::fs::create_dir_all(&data_directory)?;
 
-        Ok(Self {
+        let db = Self {
             tables: RwLock::new(HashMap::new()),
             data_directory,
             config,
-        })
+        };
+        db.save_schema(HashMap::new())?;
+
+        Ok(db)
     }
 
     pub fn load(
         data_directory: impl Into<PathBuf>,
-        schema: DatabaseSchema,
         config: DatabaseConfig,
     ) -> Result<Self, NornsDbError> {
         let data_directory = data_directory.into();
+        let schema = Self::load_schema(&data_directory)?;
         let mut tables = HashMap::new();
 
         for (name, table_schema) in schema.tables {
@@ -108,6 +118,7 @@ impl Database {
         let table_dir = self.data_directory.join(&name);
         let table = Table::new(schema, table_dir, self.config.into())?;
         tables.insert(name, table);
+        self.extract_schema_from_tables(&tables)?;
         Ok(())
     }
 
@@ -120,6 +131,7 @@ impl Database {
             .ok_or_else(|| NornsDbError::TableNotFound { name: name.clone() })?;
 
         table.destroy().await?;
+        self.extract_schema_from_tables(&tables)?;
         Ok(())
     }
 
@@ -153,8 +165,62 @@ impl Database {
         table.delete(key).await
     }
 
+    pub async fn list_rows(&self, table: &str) -> Result<Vec<(PrimaryKey, Row)>, NornsDbError> {
+        let tables = self.tables.read().await;
+        let table = tables
+            .get(table)
+            .ok_or_else(|| NornsDbError::TableNotFound {
+                name: table.to_string(),
+            })?;
+
+        table.list()
+    }
+
     pub async fn table_names(&self) -> Vec<String> {
         let tables = self.tables.read().await;
         tables.keys().cloned().collect()
+    }
+
+    pub async fn table_schema(&self, name: &str) -> Option<Arc<TableSchema>> {
+        let tables = self.tables.read().await;
+        tables.get(name).map(|table| table.schema().clone())
+    }
+
+    fn extract_schema_from_tables(
+        &self,
+        tables: &HashMap<String, Table>,
+    ) -> Result<(), NornsDbError> {
+        let schema_map: HashMap<String, _> = tables
+            .iter()
+            .map(|(name, table)| (name.clone(), table.schema().as_ref().clone()))
+            .collect();
+
+        self.save_schema(schema_map)
+    }
+
+    fn save_schema(&self, tables: HashMap<String, TableSchema>) -> Result<(), NornsDbError> {
+        let schema = DatabaseSchema { tables };
+        let encoded = bincode::encode_to_vec(schema, bincode::config::standard())?;
+
+        let tmp_path = self.data_directory.join("schema.tmp");
+        let tmp_file = File::create(self.data_directory.join("schema.tmp"))?;
+
+        let mut writer = BufWriter::new(&tmp_file);
+        writer.write_all(&encoded)?;
+        writer.flush()?;
+        tmp_file.sync_all()?;
+
+        let final_path = self.data_directory.join("schema");
+        std::fs::rename(&tmp_path, &final_path)?;
+
+        Ok(())
+    }
+
+    fn load_schema(data_directory: &Path) -> Result<DatabaseSchema, NornsDbError> {
+        let reader = BufReader::new(File::open(data_directory.join("schema"))?);
+        let schema: DatabaseSchema =
+            bincode::decode_from_reader(reader, bincode::config::standard())?;
+
+        Ok(schema)
     }
 }

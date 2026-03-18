@@ -210,6 +210,71 @@ fn test_compaction_works_with_deletion() {
     assert!(tree.get(&"some_value".to_string()).unwrap().is_none());
 }
 
+#[test]
+fn test_list_with_correct_order() {
+    let path = test_dir("test_list_with_correct_order");
+    let tree = LsmTree::new(path, 100, 10, 10).unwrap();
+
+    // let's write 10 keys with index=index, all will go to level1
+    // and will add another element just to prove a reading from level1
+    for i in 0..10 {
+        tree.insert(i, i).unwrap();
+    }
+    tree.insert(10, 10).unwrap();
+    tree.flush().unwrap();
+    tree.compact().unwrap();
+
+    // then every 2nd even item is multiplied by 2, all goes to level0
+    for i in (0..10).step_by(2) {
+        tree.insert(i, i * 2).unwrap();
+    }
+    tree.flush().unwrap();
+
+    // then every 2nd odd item is multiplied by 3, all goes to memtable
+    for i in (1..10).step_by(2) {
+        tree.insert(i, i * 3).unwrap();
+    }
+
+    let items = tree.list().unwrap();
+
+    let expected = vec![
+        (0, 0),
+        (1, 3),
+        (2, 4),
+        (3, 9),
+        (4, 8),
+        (5, 15),
+        (6, 12),
+        (7, 21),
+        (8, 16),
+        (9, 27),
+        (10, 10),
+    ];
+
+    assert_eq!(items, expected);
+}
+
+#[test]
+fn test_list_prefers_newer_value_across_level0_sstables_even_if_key_rank_differs() {
+    let tree =
+        lsm_three("list_prefers_newer_value_across_level0_sstables_even_if_key_rank_differs");
+
+    // SSTable #0 (older): key "k" at rank 0 within the table
+    tree.insert("k".to_string(), "old".to_string()).unwrap();
+    tree.flush().unwrap();
+
+    // SSTable #1 (newer): same key "k" but at a later rank (after a,b,c)
+    tree.insert("a".to_string(), "va".to_string()).unwrap();
+    tree.insert("b".to_string(), "vb".to_string()).unwrap();
+    tree.insert("c".to_string(), "vc".to_string()).unwrap();
+    tree.insert("k".to_string(), "new".to_string()).unwrap();
+    tree.flush().unwrap();
+
+    let items = tree.list().unwrap();
+    let k_value = items.iter().find(|(k, _)| k == "k").map(|(_, v)| v.clone());
+    assert_eq!(k_value, Some("new".to_string()));
+}
+
 fn lsm_three(test_name: &str) -> LsmTree<String, String> {
     let path = test_dir(test_name);
     LsmTree::new(path, 100, 10, 10).unwrap()

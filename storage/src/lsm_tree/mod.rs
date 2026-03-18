@@ -4,9 +4,10 @@ mod tests;
 use crate::ss_table::SsTable;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dbcore::error::NornsDbError;
+use itertools::Itertools;
 use metrics::{gauge, histogram};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::File,
     hash::Hash,
     io::{BufReader, BufWriter, Write},
@@ -109,7 +110,7 @@ where
         gauge!("lsm_l0_tables").set(0.0);
         gauge!("lsm_l1_tables").set(0.0);
 
-        Ok(Self {
+        let tree = Self {
             memtable: RwLock::new(BTreeMap::new()),
             memtable_size,
             data_directory,
@@ -121,7 +122,10 @@ where
             level_0_size,
             frozen_memtable: ArcSwapOption::empty(),
             store_lock: Mutex::new(()),
-        })
+        };
+
+        tree.save_state()?;
+        Ok(tree)
     }
 
     pub fn load(data_directory: impl Into<PathBuf>) -> Result<Self, NornsDbError> {
@@ -169,22 +173,105 @@ where
         })
     }
 
-    // FIXME: deal with this later
-    #[allow(clippy::type_complexity)]
-    fn load_level(
-        data_directory: &Path,
-        level_name: &str,
-        tables_number: usize,
-    ) -> Result<Vec<Arc<SsTable<K, Value<V>>>>, NornsDbError> {
-        let mut level_ss_tables = Vec::with_capacity(tables_number);
+    #[instrument(skip(self))]
+    pub fn list(&self) -> Result<Vec<(K, V)>, NornsDbError> {
+        // FIXME: rework this mess with kinda Parallel Sequential Scan.
 
-        for ss_table in 0..tables_number {
-            let path = data_directory.join(level_name).join(ss_table.to_string());
+        let build_fs_iterators = |level: &Vec<Arc<SsTable<K, Value<V>>>>, level_priority: u8| {
+            level.iter()
+                .rev()
+                .enumerate()
+                .map(move |(table_priority, ss_table)| {
+                    let iter = ss_table.iter()?.filter_map(|res| match res {
+                        Ok((k, Value::Data(v))) => Some(Ok((k, v))),
+                        Ok((_, Value::Tombstone)) => None,
+                        Err(e) => Some(Err(e)),
+                    });
 
-            let table = Arc::new(SsTable::<K, Value<V>>::load(path)?);
-            level_ss_tables.push(table);
-        }
-        Ok(level_ss_tables)
+                    Ok::<
+                        Box<dyn Iterator<Item = (u8, usize, Result<(K, V), NornsDbError>)>>,
+                        NornsDbError,
+                    >(
+                        Box::new(iter.map(move |kv| (level_priority, table_priority, kv))) as _
+                    )
+                })
+                .collect::<Result<
+                    Vec<Box<dyn Iterator<Item = (u8, usize, Result<(K, V), NornsDbError>)>>>,
+                    _,
+                >>()
+        };
+
+        let build_inmemory_iterator = |memtable: BTreeMap<K, Value<V>>, priority: usize| {
+            Box::new(
+                memtable
+                    .clone()
+                    .into_iter()
+                    .filter_map(|kv| match kv {
+                        (k, Value::Data(v)) => Some(Ok::<_, NornsDbError>((k, v))),
+                        (_, Value::Tombstone) => None,
+                    })
+                    .map(move |kv| (0u8, priority, kv)),
+            ) as Box<dyn Iterator<Item = (u8, usize, Result<(K, V), NornsDbError>)>>
+        };
+
+        let memtable = {
+            let memtable = lock_read(&self.memtable);
+            memtable.clone()
+        };
+
+        let memtable_iterator = build_inmemory_iterator(memtable, 0);
+
+        let frozen_memtable = {
+            let frozen_memtable = self.frozen_memtable.load();
+            frozen_memtable.as_ref().map(|mt| (**mt).clone())
+        };
+
+        let frozen_memtable_iterator = frozen_memtable
+            .map(|mt| build_inmemory_iterator(mt, 1))
+            .unwrap_or_else(|| {
+                Box::new(std::iter::empty())
+                    as Box<dyn Iterator<Item = (u8, usize, Result<(K, V), NornsDbError>)>>
+            });
+
+        let current_store_version = self.current_store_version.load();
+
+        let level0_iterators = build_fs_iterators(&current_store_version.level_0_ss_tables, 0)?;
+        let level1_iterators = build_fs_iterators(&current_store_version.level_1_ss_tables, 1)?;
+
+        let mut iterators = vec![memtable_iterator, frozen_memtable_iterator];
+        iterators.extend(level0_iterators);
+        iterators.extend(level1_iterators);
+
+        iterators
+            .into_iter()
+            .kmerge_by(|(level0, p0, kv0), (level1, p1, kv1)| {
+                let k0 = kv0.as_ref().ok().map(|(k, _)| k);
+                let k1 = kv1.as_ref().ok().map(|(k, _)| k);
+
+                if k0 < k1 {
+                    return true;
+                }
+
+                if level0 < level1 {
+                    return true;
+                }
+
+                p0 < p1
+            })
+            .map(|(_, _, kv)| kv)
+            .try_fold(
+                (Vec::new(), HashSet::new()),
+                |(mut items, mut keys_met), item_result| {
+                    let (key, val) = item_result?;
+
+                    if keys_met.insert(key.clone()) {
+                        items.push((key, val))
+                    }
+
+                    Ok((items, keys_met))
+                },
+            )
+            .map(|(items, _)| items)
     }
 
     #[instrument(skip(self, key, value))]
@@ -373,6 +460,24 @@ where
         self.compact_inner()
     }
 
+    // FIXME: deal with this later
+    #[allow(clippy::type_complexity)]
+    fn load_level(
+        data_directory: &Path,
+        level_name: &str,
+        tables_number: usize,
+    ) -> Result<Vec<Arc<SsTable<K, Value<V>>>>, NornsDbError> {
+        let mut level_ss_tables = Vec::with_capacity(tables_number);
+
+        for ss_table in 0..tables_number {
+            let path = data_directory.join(level_name).join(ss_table.to_string());
+
+            let table = Arc::new(SsTable::<K, Value<V>>::load(path)?);
+            level_ss_tables.push(table);
+        }
+        Ok(level_ss_tables)
+    }
+
     /// Must be called with store_lock held.
     fn compact_inner(&self) -> Result<(), NornsDbError> {
         let current = self.current_store_version.load();
@@ -388,7 +493,7 @@ where
             .map(|ss_table| ss_table.iter())
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Actual compactions happen here, an implementation of FromIterator for BTreeMap takes
+        // Actual compaction happens here, an implementation of FromIterator for BTreeMap takes
         // only the last (so most recent) item from the iterator.
         let compacted_level = iters
             .into_iter()
@@ -453,7 +558,10 @@ where
     }
 
     fn save_state(&self) -> Result<(), NornsDbError> {
-        let mut writer = BufWriter::new(File::create(self.data_directory.join("state"))?);
+        let tmp_path = self.data_directory.join("state.tmp");
+
+        let temp_file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(&temp_file);
 
         let current_store_version = self.current_store_version.load();
 
@@ -475,6 +583,9 @@ where
 
         writer.write_all(encoded_state.as_slice())?;
         writer.flush()?;
+        temp_file.sync_all()?;
+
+        std::fs::rename(tmp_path, self.data_directory.join("state"))?;
         Ok(())
     }
 }

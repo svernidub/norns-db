@@ -9,7 +9,7 @@ use std::{
     hash::Hash,
     io::{BufReader, BufWriter, Read, Seek, Write},
     marker::PhantomData,
-    path::Path,
+    path::{Path, PathBuf},
 };
 use tracing::{debug, trace};
 
@@ -17,6 +17,7 @@ pub struct SsTable<K, V> {
     bloom_filter: BloomFilter<K>,
     block_index: BTreeMap<K, BlockIndexEntry>,
     data_file: File,
+    table_path: PathBuf,
     _marker: PhantomData<V>,
 }
 
@@ -133,6 +134,7 @@ where
             bloom_filter,
             block_index,
             data_file: File::open(data_file_name)?,
+            table_path: table_path.to_path_buf(),
             _marker: Default::default(),
         })
     }
@@ -169,6 +171,7 @@ where
             bloom_filter,
             block_index,
             data_file: File::open(table_path.with_extension("data"))?,
+            table_path: table_path.to_path_buf(),
             _marker: Default::default(),
         })
     }
@@ -211,8 +214,10 @@ where
     }
 
     pub fn iter(&self) -> Result<SsTableIter<K, V>, NornsDbError> {
+        let data_file = File::open(self.table_path.with_extension("data"))?;
+
         Ok(SsTableIter {
-            reader: BufReader::new(self.data_file.try_clone()?),
+            reader: BufReader::new(data_file),
             phantom_data: Default::default(),
         })
     }

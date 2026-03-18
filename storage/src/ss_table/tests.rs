@@ -61,7 +61,7 @@ fn test_missing_key_is_not_searched_in_db() {
 
 #[test]
 fn test_iterator_consumption() {
-    let table = ss_table("test_iterator");
+    let table = ss_table("iterator_consumption");
 
     let map: BTreeMap<_, _> = table.iter().unwrap().collect::<Result<_, _>>().unwrap();
 
@@ -70,8 +70,18 @@ fn test_iterator_consumption() {
 }
 
 #[test]
+fn test_sequential_iterator_consumptions() {
+    let table = ss_table("sequential_iterator_consumptions");
+
+    let first_attempt: Vec<_> = table.iter().unwrap().collect::<Result<_, _>>().unwrap();
+    let second_attempt: Vec<_> = table.iter().unwrap().collect::<Result<_, _>>().unwrap();
+
+    assert_eq!(first_attempt.len(), second_attempt.len());
+}
+
+#[test]
 fn test_finds_last_key_in_block() {
-    let table = ss_table("test_finds_last_key_in_block");
+    let table = ss_table("finds_last_key_in_block");
 
     // Collect sorted keys to find the last key in the first block (block_size=10)
     let mut keys: Vec<_> = (0..10000).map(|i| format!("key_{i}")).collect();

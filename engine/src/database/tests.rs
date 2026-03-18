@@ -243,12 +243,116 @@ async fn test_load() {
         db.insert("users", key, row).await.unwrap();
     }
 
-    let schema = DatabaseSchema {
-        tables: HashMap::from([("users".to_string(), users_schema())]),
-    };
-    let db = Database::load(&db_path, schema, test_config()).unwrap();
+    let db = Database::load(&db_path, test_config()).unwrap();
 
     let result = db.get("users", &PrimaryKey::Integer(42)).await.unwrap();
+    assert!(matches!(
+        result,
+        Some(Row(cols)) if matches!(cols.as_slice(), [Column::Varchar(name)] if name == "Bob")
+    ));
+}
+
+#[tokio::test]
+async fn test_load_with_created_table() {
+    let db_path = test_dir("test_load_with_created_table");
+
+    {
+        let db = Database::new(&db_path, test_config()).unwrap();
+        db.create_table("users", users_schema()).await.unwrap();
+    }
+
+    let db = Database::load(&db_path, test_config()).unwrap();
+
+    let names = db.table_names().await;
+    assert!(names.contains(&"users".to_string()));
+}
+
+#[tokio::test]
+async fn test_load_with_multiple_tables() {
+    let db_path = test_dir("test_load_with_multiple_tables");
+
+    let orders_schema = TableSchema {
+        primary_key_name: "order_id".to_string(),
+        primary_key_type: PrimaryKeyType::BigInteger,
+        columns: vec![
+            ("product".to_string(), ColumnType::Varchar),
+            ("quantity".to_string(), ColumnType::Integer),
+        ],
+    };
+
+    {
+        let db = Database::new(&db_path, test_config()).unwrap();
+
+        db.create_table("users", users_schema()).await.unwrap();
+        db.create_table("orders", orders_schema).await.unwrap();
+    }
+
+    let db = Database::load(&db_path, test_config()).unwrap();
+
+    let mut names = db.table_names().await;
+    names.sort();
+    assert_eq!(names, vec!["orders", "users"]);
+}
+
+#[tokio::test]
+async fn test_load_when_table_was_dropped() {
+    let db_path = test_dir("test_load_when_table_was_dropped");
+
+    {
+        let db = Database::new(&db_path, test_config()).unwrap();
+
+        db.create_table("users", users_schema()).await.unwrap();
+        db.create_table("orders", users_schema()).await.unwrap();
+
+        db.drop_table("orders").await.unwrap();
+    }
+
+    let db = Database::load(&db_path, test_config()).unwrap();
+
+    let names = db.table_names().await;
+    assert_eq!(names, vec!["users"]);
+}
+
+#[tokio::test]
+async fn test_load_when_no_tables_exist() {
+    let db_path = test_dir("test_load_no_tables");
+
+    {
+        let _db = Database::new(&db_path, test_config()).unwrap();
+    }
+
+    let db = Database::load(&db_path, test_config()).unwrap();
+
+    let names = db.table_names().await;
+    assert!(names.is_empty());
+}
+
+#[tokio::test]
+async fn test_load_with_data_preserved_across_restart() {
+    let db_path = test_dir("test_load_data_preserved");
+
+    {
+        let db = Database::new(&db_path, test_config()).unwrap();
+        db.create_table("users", users_schema()).await.unwrap();
+
+        let key = PrimaryKey::Integer(1);
+        let row = Row(vec![Column::Varchar("Alice".to_string())]);
+        db.insert("users", key, row).await.unwrap();
+
+        let key = PrimaryKey::Integer(2);
+        let row = Row(vec![Column::Varchar("Bob".to_string())]);
+        db.insert("users", key, row).await.unwrap();
+    }
+
+    let db = Database::load(&db_path, test_config()).unwrap();
+
+    let result = db.get("users", &PrimaryKey::Integer(1)).await.unwrap();
+    assert!(matches!(
+        result,
+        Some(Row(cols)) if matches!(cols.as_slice(), [Column::Varchar(name)] if name == "Alice")
+    ));
+
+    let result = db.get("users", &PrimaryKey::Integer(2)).await.unwrap();
     assert!(matches!(
         result,
         Some(Row(cols)) if matches!(cols.as_slice(), [Column::Varchar(name)] if name == "Bob")

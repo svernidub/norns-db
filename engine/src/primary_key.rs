@@ -6,7 +6,7 @@ pub enum PrimaryKey {
     Timestamp(i64),
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, bincode::Encode, bincode::Decode)]
 pub enum PrimaryKeyType {
     Integer,
     BigInteger,

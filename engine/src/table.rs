@@ -5,16 +5,19 @@ use crate::{
 };
 use dbcore::error::NornsDbError;
 use journal::{Journal, JournalRecord, JournalRecordKind};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use storage::lsm_tree::LsmTree;
 
 pub struct Table {
-    schema: TableSchema,
+    schema: Arc<TableSchema>,
     storage: LsmTree<PrimaryKey, Row>,
     journal: Journal<PrimaryKey, Row>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
 pub struct TableSchema {
     pub primary_key_name: String,
     pub primary_key_type: PrimaryKeyType,
@@ -51,7 +54,7 @@ impl Table {
         )?;
 
         Ok(Self {
-            schema,
+            schema: Arc::new(schema),
             storage,
             journal,
         })
@@ -61,7 +64,7 @@ impl Table {
         let wal_path = data_directory.join("wal.log");
 
         Ok(Self {
-            schema,
+            schema: Arc::new(schema),
             storage: LsmTree::load(data_directory)?,
             journal: Journal::new(wal_path)?,
         })
@@ -92,6 +95,10 @@ impl Table {
         self.storage.get(primary_key)
     }
 
+    pub fn list(&self) -> Result<Vec<(PrimaryKey, Row)>, NornsDbError> {
+        self.storage.list()
+    }
+
     pub async fn delete(&self, primary_key: PrimaryKey) -> Result<Option<Row>, NornsDbError> {
         let record = JournalRecord::new(JournalRecordKind::Delete {
             key: primary_key.clone(),
@@ -100,6 +107,10 @@ impl Table {
         self.journal.append(&record).await?;
 
         self.storage.delete(primary_key)
+    }
+
+    pub fn schema(&self) -> Arc<TableSchema> {
+        self.schema.clone()
     }
 
     fn validate_key(&self, key: &PrimaryKey) -> Result<(), NornsDbError> {

@@ -41,6 +41,14 @@ jobs:
       - run: cargo install cargo-machete
       - run: cargo machete
 
+  cargo-sort:
+    name: Sorted dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-sort
+      - run: cargo sort --workspace --check
+
   test:
     name: Tests
     runs-on: ubuntu-latest
