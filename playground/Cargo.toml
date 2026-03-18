@@ -6,7 +6,6 @@ description = "Vibecoded and manual scripts for kinda testing things in integrat
 
 [dependencies]
 
-console-subscriber = "0.5.0"
 engine = { path = "../engine" }
 metrics-exporter-opentelemetry = { workspace = true }
 opentelemetry = { workspace = true }
