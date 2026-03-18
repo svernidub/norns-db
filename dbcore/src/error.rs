@@ -14,6 +14,9 @@ pub enum NornsDbError {
     #[error("data corrupted: {0}")]
     DataCorrupted(String),
 
+    #[error("configuration error: {0}")]
+    Config(String),
+
     #[error("primary key type mismatch: expected {expected}, got {actual}")]
     PrimaryKeyTypeMismatch { expected: String, actual: String },
 

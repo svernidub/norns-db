@@ -3,7 +3,7 @@ mod handlers;
 mod models;
 
 use axum::{Router, routing::get};
-use engine::{Database, DatabaseConfig};
+use engine::{Database, NornsConfig};
 use std::{path::PathBuf, sync::Arc};
 
 fn router(db: Arc<Database>) -> Router {
@@ -23,48 +23,69 @@ fn router(db: Arc<Database>) -> Router {
         .with_state(db)
 }
 
-fn load_or_create_db(data_dir: &PathBuf, config: DatabaseConfig) -> Database {
+fn load_or_create_db(
+    data_dir: &PathBuf,
+    config: engine::DatabaseConfig,
+) -> Result<Database, dbcore::error::NornsDbError> {
     if data_dir.join("schema").exists() {
         eprintln!("Loading existing database from {}", data_dir.display());
-        Database::load(data_dir, config).expect("failed to load database")
+        Database::load(data_dir, config)
     } else {
         eprintln!("Creating new database at {}", data_dir.display());
-        Database::new(data_dir, config).expect("failed to create database")
+        Database::new(data_dir, config)
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let data_dir: PathBuf = std::env::var("NORNS_DATA_DIR")
-        .unwrap_or_else(|_| "data".to_string())
-        .into();
-
-    let config = DatabaseConfig {
-        memtable_size: 10_000,
-        level_0_size: 15,
-        ss_table_block_size: 4096,
+    let cfg = match NornsConfig::load_from_env() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     };
 
-    let db = Arc::new(load_or_create_db(&data_dir, config));
+    let data_dir = cfg.data_directory_path();
+    let config = cfg.database_config();
+
+    let db = match load_or_create_db(&data_dir, config) {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            eprintln!(
+                "Failed to load/create database at {}: {e}",
+                data_dir.display()
+            );
+            std::process::exit(1);
+        }
+    };
 
     let bind = std::env::var("NORNS_BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-    let listener = tokio::net::TcpListener::bind(&bind)
-        .await
-        .expect("failed to bind");
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind to {bind}: {e}");
+            std::process::exit(1);
+        }
+    };
 
     eprintln!("Listening on {bind}");
 
     let shutdown = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for ctrl+c");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("Failed to listen for ctrl+c: {e}");
+            return;
+        }
         eprintln!("Shutting down...");
     };
 
     tokio::select! {
         result = axum::serve(listener, router(db.clone()))
             .with_graceful_shutdown(shutdown) => {
-            result.expect("server error");
+            if let Err(e) = result {
+                eprintln!("Server error: {e}");
+                std::process::exit(1);
+            }
         }
         _ = async {
             tokio::signal::ctrl_c().await.ok();
