@@ -1,273 +1,439 @@
-use engine::{
-    Database, DatabaseConfig, TableSchema,
-    column::{Column, ColumnType},
-    primary_key::{PrimaryKey, PrimaryKeyType},
-    row::Row,
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use opentelemetry::trace::TracerProvider;
-use opentelemetry_sdk::propagation::TraceContextPropagator;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+
+use reqwest::Client;
+use tokio::time::sleep;
 use tracing::{error, info, instrument};
-use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
 
-const NUM_WRITERS: usize = 10;
-const ENTRIES_PER_WRITER: usize = 15000;
+const LOGS_TABLE: &str = "logs";
+const TOTAL_WRITES: u64 = 1_000_000;
+const NUM_WRITERS: usize = 8;
 const NUM_READERS: usize = 4;
-const READER_PROBES: usize = 2000;
 
-/// Demonstrates the Database API with concurrent reads and writes.
-///
-/// The write path (handled internally by Database → Table → Journal + LsmTree):
-///   1. Validate key/row against the table schema
-///   2. Append to WAL (fsync) — durability guarantee
-///   3. Insert into the LSM tree memtable — fast, in-memory
-///
-/// The read path hits (in order):
-///   1. Active memtable (in-memory BTreeMap)
-///   2. Frozen memtable (if a flush is in progress)
-///   3. Level-0 SSTables (most recent first)
-///   4. Level-1 SSTables (compacted)
-#[instrument(skip(db, writes_done))]
-async fn writer_task(writer_id: usize, db: Arc<Database>, writes_done: Arc<AtomicUsize>) {
-    for i in 0..ENTRIES_PER_WRITER {
-        let key = PrimaryKey::Varchar(format!("key_{writer_id}_{i}"));
-        let row = Row(vec![Column::Varchar(format!("value_{writer_id}_{i}"))]);
+const LIST_INTERVAL_SECS: u64 = 1;
+const DELETE_INTERVAL_MILLIS: u64 = 500;
 
-        db.insert("entries", key, row).await.expect("insert failed");
+const LOG_MESSAGES: [&str; 10] = [
+    "user logged in",
+    "user logged out",
+    "order created",
+    "order cancelled",
+    "payment succeeded",
+    "payment failed",
+    "cache miss",
+    "cache hit",
+    "background job started",
+    "background job finished",
+];
 
-        writes_done.fetch_add(1, Ordering::Relaxed);
-    }
-    info!(writer_id, entries = ENTRIES_PER_WRITER, "writer done");
+const LOG_LEVELS: [&str; 3] = ["INFO", "WARN", "ERROR"];
+
+fn now_millis() -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+
+    now.as_millis() as i64
 }
 
-#[instrument(skip(db, writes_done))]
-async fn reader_task(reader_id: usize, db: Arc<Database>, writes_done: Arc<AtomicUsize>) {
-    while writes_done.load(Ordering::Relaxed) == 0 {
+fn message_for_id(id: u64) -> &'static str {
+    let idx = (id as usize) % LOG_MESSAGES.len();
+    LOG_MESSAGES[idx]
+}
+
+fn level_for_id(id: u64) -> &'static str {
+    let idx = (id as usize) % LOG_LEVELS.len();
+    LOG_LEVELS[idx]
+}
+
+fn sample_key_id(counter: u64, max_id: u64) -> Option<u64> {
+    if max_id == 0 {
+        return None;
+    }
+
+    let m = max_id;
+    let a = 1664525_u64;
+    let c = 1013904223_u64;
+
+    let candidate = (a.wrapping_mul(counter).wrapping_add(c)) % m;
+    Some(candidate)
+}
+
+async fn create_logs_table(client: &Client, base_url: &str) -> Result<(), reqwest::Error> {
+    let url = format!("{base_url}/{LOGS_TABLE}");
+
+    let body = serde_json::json!({
+        "primary_key": {
+            "name": "id",
+            "type": "big_integer",
+        },
+        "columns": [
+            { "name": "level", "type": "varchar" },
+            { "name": "message", "type": "varchar" },
+            { "name": "ts", "type": "timestamp" },
+        ],
+    });
+
+    let response = client.post(url).json(&body).send().await?;
+
+    if response.status().is_success() {
+        info!("logs table created via API");
+    } else {
+        info!(
+            status = %response.status(),
+            "create logs table returned non-success status (assuming it may already exist)"
+        );
+    }
+
+    Ok(())
+}
+
+async fn drop_logs_table(client: &Client, base_url: &str) -> Result<(), reqwest::Error> {
+    let url = format!("{base_url}/{LOGS_TABLE}");
+
+    let response = client.delete(url).send().await?;
+
+    if response.status().is_success() {
+        info!("logs table dropped via API");
+    } else {
+        error!(status = %response.status(), "failed to drop logs table via API");
+    }
+
+    Ok(())
+}
+
+async fn insert_log(client: &Client, base_url: &str, id: u64) -> Result<(), reqwest::Error> {
+    let url = format!("{base_url}/{LOGS_TABLE}/{id}");
+
+    let level = level_for_id(id);
+    let message = message_for_id(id);
+    let ts = now_millis();
+
+    let body = serde_json::json!({
+        "level": level,
+        "message": message,
+        "ts": ts,
+    });
+
+    let response = client.post(url).json(&body).send().await?;
+
+    if !response.status().is_success() {
+        error!(id, status = %response.status(), "insert_log returned non-success status");
+    }
+
+    Ok(())
+}
+
+async fn get_log(client: &Client, base_url: &str, id: u64) -> Result<(), reqwest::Error> {
+    let url = format!("{base_url}/{LOGS_TABLE}/{id}");
+
+    let response = client.get(url).send().await?;
+
+    if !response.status().is_success() && response.status().as_u16() != 404 {
+        error!(id, status = %response.status(), "get_log returned non-success status");
+    }
+
+    Ok(())
+}
+
+async fn list_logs(client: &Client, base_url: &str) -> Result<(), reqwest::Error> {
+    let url = format!("{base_url}/{LOGS_TABLE}");
+
+    let response = client.get(url).send().await?;
+
+    if !response.status().is_success() {
+        error!(status = %response.status(), "list_logs returned non-success status");
+        return Ok(());
+    }
+
+    let body = response.json::<serde_json::Value>().await?;
+
+    let count = body.as_array().map(|a| a.len()).unwrap_or(0);
+
+    info!(count, "list_logs returned rows");
+
+    Ok(())
+}
+
+async fn delete_log(client: &Client, base_url: &str, id: u64) -> Result<(), reqwest::Error> {
+    let url = format!("{base_url}/{LOGS_TABLE}/{id}");
+
+    let response = client.delete(url).send().await?;
+
+    if response.status().is_success() {
+        info!(id, "delete_log succeeded");
+    } else if response.status().as_u16() == 404 {
+        info!(id, "delete_log got 404 (already gone)");
+    } else {
+        error!(id, status = %response.status(), "delete_log returned non-success status");
+    }
+
+    Ok(())
+}
+
+#[instrument(skip(client, writes_started, writes_completed))]
+async fn writer_task(
+    writer_id: usize,
+    client: Arc<Client>,
+    base_url: String,
+    writes_started: Arc<AtomicU64>,
+    writes_completed: Arc<AtomicU64>,
+) {
+    loop {
+        let id = writes_started.fetch_add(1, Ordering::Relaxed);
+
+        if id >= TOTAL_WRITES {
+            break;
+        }
+
+        if let Err(error) = insert_log(&client, &base_url, id).await {
+            error!(%error, writer_id, id, "writer failed to insert log");
+            continue;
+        }
+
+        writes_completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    info!(writer_id, "writer finished");
+}
+
+#[instrument(skip(client, writes_completed, shutdown))]
+async fn reader_task(
+    reader_id: usize,
+    client: Arc<Client>,
+    base_url: String,
+    writes_completed: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut local_counter = 0_u64;
+    let mut found_or_ok = 0_u64;
+    let mut not_found = 0_u64;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let completed = writes_completed.load(Ordering::Relaxed);
+
+        if completed == 0 {
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        if let Some(id) = sample_key_id(local_counter, completed) {
+            if let Err(error) = get_log(&client, &base_url, id).await {
+                error!(%error, reader_id, id, "reader failed to get log");
+            } else {
+                found_or_ok += 1;
+            }
+        } else {
+            not_found += 1;
+        }
+
+        local_counter = local_counter.wrapping_add(1);
+
+        if local_counter.is_multiple_of(10_000) {
+            info!(
+                reader_id,
+                found_or_ok, not_found, completed, "reader progress"
+            );
+        }
+
         tokio::task::yield_now().await;
     }
 
-    let mut found = 0;
-    let mut not_found = 0;
+    info!(reader_id, found_or_ok, not_found, "reader finished");
+}
 
-    for probe in 0..READER_PROBES {
-        let writer_id = probe % NUM_WRITERS;
-        let key_id = probe % ENTRIES_PER_WRITER;
-        let key = PrimaryKey::Varchar(format!("key_{writer_id}_{key_id}"));
-
-        match db.get("entries", &key).await {
-            Ok(Some(_)) => found += 1,
-            Ok(None) => not_found += 1,
-            Err(e) => error!(reader_id, error = %e, "reader error"),
+#[instrument(skip(client, writes_completed, shutdown))]
+async fn lister_task(
+    client: Arc<Client>,
+    base_url: String,
+    writes_completed: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
         }
+
+        let completed = writes_completed.load(Ordering::Relaxed);
+
+        if completed > 0
+            && let Err(error) = list_logs(&client, &base_url).await
+        {
+            error!(%error, "lister failed to list logs");
+        }
+
+        sleep(Duration::from_secs(LIST_INTERVAL_SECS)).await;
     }
 
-    let total_writes = writes_done.load(Ordering::Relaxed);
-    info!(
-        reader_id,
-        found,
-        not_found,
-        writes_at_finish = total_writes,
-        total_writes = NUM_WRITERS * ENTRIES_PER_WRITER,
-        "reader done"
-    );
+    info!("lister finished");
+}
+
+#[instrument(skip(client, writes_completed, shutdown))]
+async fn deleter_task(
+    client: Arc<Client>,
+    base_url: String,
+    writes_completed: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut local_counter = 0_u64;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let completed = writes_completed.load(Ordering::Relaxed);
+
+        if completed > 0
+            && let Some(id) = sample_key_id(local_counter, completed)
+            && let Err(error) = delete_log(&client, &base_url, id).await
+        {
+            error!(%error, id, "deleter failed to delete log");
+        }
+
+        local_counter = local_counter.wrapping_add(1);
+
+        sleep(Duration::from_millis(DELETE_INTERVAL_MILLIS)).await;
+    }
+
+    info!("deleter finished");
 }
 
 #[instrument]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let tmp_dir = std::env::temp_dir().join(format!("norns-db-example-{}", std::process::id()));
+    let base_url =
+        std::env::var("PLAYGROUND_API_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
-    info!(dir = %tmp_dir.display(), "starting norns-db playground");
+    info!(%base_url, "starting HTTP playground");
 
-    let config = DatabaseConfig {
-        memtable_size: 10000,
-        level_0_size: 15,
-        ss_table_block_size: 4096,
-    };
+    let client = Arc::new(Client::builder().build()?);
 
-    let db = Arc::new(Database::new(&tmp_dir, config)?);
+    create_logs_table(&client, &base_url).await?;
 
-    let schema = TableSchema {
-        primary_key_name: "key".to_string(),
-        primary_key_type: PrimaryKeyType::Varchar,
-        columns: vec![("value".to_string(), ColumnType::Varchar)],
-    };
-    db.create_table("entries", schema).await?;
+    let writes_started = Arc::new(AtomicU64::new(0));
+    let writes_completed = Arc::new(AtomicU64::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    info!(
-        writers = NUM_WRITERS,
-        entries_per_writer = ENTRIES_PER_WRITER,
-        readers = NUM_READERS,
-        reader_probes = READER_PROBES,
-        "starting concurrent workload"
-    );
-
-    let writes_done = Arc::new(AtomicUsize::new(0));
-
-    // -- Spawn concurrent writers --
-    let mut writer_handles = vec![];
+    let mut writer_handles = Vec::with_capacity(NUM_WRITERS);
     for writer_id in 0..NUM_WRITERS {
-        let db = db.clone();
-        let writes_done = writes_done.clone();
-        let handle = tokio::spawn(writer_task(writer_id, db, writes_done));
+        let client = Arc::clone(&client);
+        let base_url = base_url.clone();
+        let writes_started = Arc::clone(&writes_started);
+        let writes_completed = Arc::clone(&writes_completed);
+
+        let handle = tokio::spawn(writer_task(
+            writer_id,
+            client,
+            base_url,
+            writes_started,
+            writes_completed,
+        ));
+
         writer_handles.push(handle);
     }
 
-    // -- Spawn concurrent readers --
-    let mut reader_handles = vec![];
+    let mut reader_handles = Vec::with_capacity(NUM_READERS);
     for reader_id in 0..NUM_READERS {
-        let db = db.clone();
-        let writes_done = writes_done.clone();
-        let handle = tokio::spawn(reader_task(reader_id, db, writes_done));
+        let client = Arc::clone(&client);
+        let base_url = base_url.clone();
+        let writes_completed = Arc::clone(&writes_completed);
+        let shutdown = Arc::clone(&shutdown);
+
+        let handle = tokio::spawn(reader_task(
+            reader_id,
+            client,
+            base_url,
+            writes_completed,
+            shutdown,
+        ));
+
         reader_handles.push(handle);
     }
 
-    // -- Wait for everything --
-    for h in writer_handles {
-        h.await?;
-    }
-    for h in reader_handles {
-        h.await?;
-    }
+    let lister_client = Arc::clone(&client);
+    let lister_base_url = base_url.clone();
+    let lister_writes_completed = Arc::clone(&writes_completed);
+    let lister_shutdown = Arc::clone(&shutdown);
+    let lister_handle = tokio::spawn(lister_task(
+        lister_client,
+        lister_base_url,
+        lister_writes_completed,
+        lister_shutdown,
+    ));
 
-    // -- Verify all data is present --
-    info!("all tasks finished, verifying data integrity");
+    let deleter_client = Arc::clone(&client);
+    let deleter_base_url = base_url.clone();
+    let deleter_writes_completed = Arc::clone(&writes_completed);
+    let deleter_shutdown = Arc::clone(&shutdown);
+    let deleter_handle = tokio::spawn(deleter_task(
+        deleter_client,
+        deleter_base_url,
+        deleter_writes_completed,
+        deleter_shutdown,
+    ));
 
-    let mut verified = 0;
-    for writer_id in 0..NUM_WRITERS {
-        for i in 0..ENTRIES_PER_WRITER {
-            let key = PrimaryKey::Varchar(format!("key_{writer_id}_{i}"));
-            let expected = format!("value_{writer_id}_{i}");
-
-            let row = db
-                .get("entries", &key)
-                .await?
-                .unwrap_or_else(|| panic!("missing key: key_{writer_id}_{i}"));
-
-            match &row.0[0] {
-                Column::Varchar(v) => assert_eq!(v, &expected, "mismatch for key_{writer_id}_{i}"),
-                other => panic!("unexpected column type: {other:?}"),
-            }
-            verified += 1;
+    for handle in writer_handles {
+        if let Err(error) = handle.await {
+            error!(%error, "writer task join error");
         }
     }
-    info!(verified, "all entries verified OK");
 
-    // -- Demonstrate delete --
-    let del_key = PrimaryKey::Varchar("key_0_0".to_string());
-    info!("deleting key_0_0");
-    db.delete("entries", del_key.clone()).await?;
-    assert!(db.get("entries", &del_key).await?.is_none());
-    info!("key_0_0 deleted and confirmed absent");
+    shutdown.store(true, Ordering::Relaxed);
 
-    // -- Demonstrate drop table --
-    info!("dropping table 'entries'");
-    db.drop_table("entries").await?;
+    for handle in reader_handles {
+        if let Err(error) = handle.await {
+            error!(%error, "reader task join error");
+        }
+    }
 
-    let names = db.table_names().await;
-    assert!(names.is_empty());
-    info!("table dropped, database is empty");
+    if let Err(error) = lister_handle.await {
+        error!(%error, "lister task join error");
+    }
 
-    // -- Cleanup --
-    let db = Arc::into_inner(db).expect("outstanding Arc references to Database");
-    db.destroy().await?;
-    info!("database destroyed");
+    if let Err(error) = deleter_handle.await {
+        error!(%error, "deleter task join error");
+    }
+
+    let started = writes_started.load(Ordering::Relaxed);
+    let completed = writes_completed.load(Ordering::Relaxed);
+
+    info!(
+        started,
+        completed,
+        target = TOTAL_WRITES,
+        "workload finished"
+    );
+
+    if let Err(error) = drop_logs_table(&client, &base_url).await {
+        error!(%error, "failed to drop logs table at the end of playground");
+    }
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let tracing_enabled = std::env::var("NORNS_TRACING").is_ok();
-
-    // -- Traces (conditional on NORNS_TRACING) --
-    let tracer_provider = if tracing_enabled {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .build()?;
-        Some(
-            opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .build(),
-        )
-    } else {
-        None
-    };
-
-    // -- Metrics (always on) --
-    let otlp_metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .build()?;
-
-    let (meter_provider, _recorder) =
-        metrics_exporter_opentelemetry::Recorder::builder("norns-db-playground")
-            .with_meter_provider(|b| {
-                let reader =
-                    opentelemetry_sdk::metrics::PeriodicReader::builder(otlp_metric_exporter)
-                        .with_interval(std::time::Duration::from_secs(5))
-                        .build();
-                b.with_reader(reader)
-            })
-            .install()?;
-
-    opentelemetry::global::set_meter_provider(meter_provider.clone());
-
-    // -- Logs (always on) --
-    let otlp_log_exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_http()
-        .build()?;
-
-    let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
-        .with_batch_exporter(otlp_log_exporter)
-        .build();
-
-    // Option<Layer> is itself a Layer (None = no-op)
-    let otel_trace_layer = tracer_provider
-        .as_ref()
-        .map(|tp| tracing_opentelemetry::layer().with_tracer(tp.tracer("norns-db-playground")));
-
-    // Filter out OpenTelemetry SDK internal logs from the bridge to prevent
-    // infinite recursion: bridge → logger → SDK log → bridge → ...
-    let otel_log_layer =
-        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider)
-            .with_filter(
-                tracing_subscriber::filter::Targets::new()
-                    .with_default(tracing::Level::TRACE)
-                    .with_target(
-                        "opentelemetry",
-                        tracing_subscriber::filter::LevelFilter::OFF,
-                    )
-                    .with_target(
-                        "opentelemetry_sdk",
-                        tracing_subscriber::filter::LevelFilter::OFF,
-                    ),
-            );
-
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    let fmt_layer = tracing_subscriber::fmt::layer().json();
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .with(otel_trace_layer)
-        .with(otel_log_layer)
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .json()
         .init();
 
-    run().await?;
-
-    // Shutdown OpenTelemetry providers, flushing any pending data.
-    // Logger provider last so it can still capture shutdown logs from the others.
-    meter_provider.shutdown()?;
-    if let Some(tp) = tracer_provider {
-        tp.shutdown()?;
+    if let Err(error) = run().await {
+        error!(%error, "playground run failed");
+        return Err(error);
     }
-    logger_provider.shutdown()?;
 
     Ok(())
 }

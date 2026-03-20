@@ -22,6 +22,7 @@ where
     K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()>,
     V: Clone + bincode::Encode + bincode::Decode<()>,
 {
+    table_name: String,
     memtable: RwLock<BTreeMap<K, Value<V>>>,
     memtable_size: usize,
     data_directory: PathBuf,
@@ -83,6 +84,7 @@ where
     V: Clone + bincode::Encode + bincode::Decode<()>,
 {
     pub fn new(
+        table_name: String,
         data_directory: impl Into<PathBuf>,
         memtable_size: usize,
         level_0_size: usize,
@@ -107,10 +109,11 @@ where
             "LSM tree created"
         );
 
-        gauge!("lsm_l0_tables").set(0.0);
-        gauge!("lsm_l1_tables").set(0.0);
+        gauge!("norns_lsm_l0_tables", "table_name" => table_name.clone()).set(0.0);
+        gauge!("norns_lsm_l1_tables", "table_name" => table_name.clone()).set(0.0);
 
         let tree = Self {
+            table_name,
             memtable: RwLock::new(BTreeMap::new()),
             memtable_size,
             data_directory,
@@ -128,7 +131,10 @@ where
         Ok(tree)
     }
 
-    pub fn load(data_directory: impl Into<PathBuf>) -> Result<Self, NornsDbError> {
+    pub fn load(
+        table_name: String,
+        data_directory: impl Into<PathBuf>,
+    ) -> Result<Self, NornsDbError> {
         let data_directory = data_directory.into();
         debug!(dir = %data_directory.display(), "loading LSM tree");
 
@@ -155,10 +161,13 @@ where
         let level_0_ss_tables = Self::load_level(&data_directory, "level0", level_0_ss_tables)?;
         let level_1_ss_tables = Self::load_level(&data_directory, "level1", level_1_ss_tables)?;
 
-        gauge!("lsm_l0_tables").set(level_0_ss_tables.len() as f64);
-        gauge!("lsm_l1_tables").set(level_1_ss_tables.len() as f64);
+        gauge!("norns_lsm_l0_tables", "table_name" => table_name.clone())
+            .set(level_0_ss_tables.len() as f64);
+        gauge!("norns_lsm_l1_tables", "table_name" => table_name.clone())
+            .set(level_1_ss_tables.len() as f64);
 
         Ok(Self {
+            table_name,
             memtable: RwLock::new(BTreeMap::new()),
             memtable_size,
             data_directory,
@@ -295,7 +304,9 @@ where
             memtable.len()
         };
 
-        histogram!("lsm_insert_duration_microseconds").record(start.elapsed().as_micros() as f64);
+        histogram!("norns_lsm_insert_duration_us", "table_name" => self.table_name.clone())
+            .record(start.elapsed().as_micros() as f64);
+
         Ok(())
     }
 
@@ -351,7 +362,9 @@ where
             Ok(None)
         })();
 
-        histogram!("lsm_get_duration_microseconds").record(start.elapsed().as_micros() as f64);
+        histogram!("norns_lsm_get_duration_us", "table_name" => self.table_name.clone())
+            .record(start.elapsed().as_micros() as f64);
+
         result
     }
 
@@ -397,6 +410,8 @@ where
     }
 
     pub fn flush(&self) -> Result<(), NornsDbError> {
+        let start = Instant::now();
+
         let _guard = self.store_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         let data = {
@@ -413,8 +428,6 @@ where
             data
         };
 
-        let start = Instant::now();
-
         let current_store_version = self.current_store_version.load();
 
         let path = self
@@ -426,6 +439,7 @@ where
 
         let mut new_level_0_ss_tables = current_store_version.level_0_ss_tables.clone();
         new_level_0_ss_tables.push(new_table.into());
+        let level0_size = new_level_0_ss_tables.len();
 
         let needs_compaction = new_level_0_ss_tables.len() == self.level_0_size;
 
@@ -436,9 +450,11 @@ where
 
         self.frozen_memtable.store(None);
 
-        histogram!("lsm_flush_duration_seconds").record(start.elapsed().as_secs_f64());
-        gauge!("lsm_l0_tables")
-            .set(self.current_store_version.load().level_0_ss_tables.len() as f64);
+        histogram!("norns_lsm_flush_duration_ms", "table_name" => self.table_name.clone())
+            .record(start.elapsed().as_millis() as f64);
+
+        gauge!("norns_lsm_l0_tables", "table_name" => self.table_name.clone())
+            .set(level0_size as f64);
 
         info!("memtable flushed to L0 SSTable");
 
@@ -480,12 +496,12 @@ where
 
     /// Must be called with store_lock held.
     fn compact_inner(&self) -> Result<(), NornsDbError> {
+        let start = Instant::now();
+
         let current = self.current_store_version.load();
 
         let l0_count = current.level_0_ss_tables.len();
         info!(l0_tables = l0_count, "starting L0 -> L1 compaction");
-
-        let start = Instant::now();
 
         let iters = current
             .level_0_ss_tables
@@ -530,11 +546,15 @@ where
 
         self.save_state()?;
 
-        histogram!("lsm_l0_compaction_duration_seconds").record(start.elapsed().as_secs_f64());
+        histogram!("norns_lsm_l0_compaction_duration_ms", "table_name" => self.table_name.clone())
+            .record(start.elapsed().as_millis() as f64);
 
         let store = self.current_store_version.load();
-        gauge!("lsm_l0_tables").set(store.level_0_ss_tables.len() as f64);
-        gauge!("lsm_l1_tables").set(store.level_1_ss_tables.len() as f64);
+        gauge!("norns_lsm_l0_tables", "table_name" => self.table_name.clone())
+            .set(store.level_0_ss_tables.len() as f64);
+
+        gauge!("norns_lsm_l1_tables", "table_name" => self.table_name.clone())
+            .set(store.level_1_ss_tables.len() as f64);
 
         info!(
             l0_compacted = l0_count,
