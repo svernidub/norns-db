@@ -84,7 +84,7 @@ impl Database {
 
         for (name, table_schema) in schema.tables {
             let table_dir = data_directory.join(&name);
-            let table = Table::load(table_schema, table_dir)?;
+            let table = Table::load(name.clone(), table_schema, table_dir)?;
             tables.insert(name, table);
         }
 
@@ -116,7 +116,7 @@ impl Database {
         }
 
         let table_dir = self.data_directory.join(&name);
-        let table = Table::new(schema, table_dir, self.config.into())?;
+        let table = Table::new(name.clone(), schema, table_dir, self.config.into())?;
         tables.insert(name, table);
         self.extract_schema_from_tables(&tables)?;
         Ok(())

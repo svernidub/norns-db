@@ -45,7 +45,14 @@ fn test_memtable_never_exceeds_configured_size_while_all_data_is_accessible() {
 #[test]
 fn test_finds_key_across_multiple_ss_tables() {
     let path = test_dir("test_finds_key_across_multiple_ss_tables");
-    let tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
+    let tree = LsmTree::new(
+        "test_finds_key_across_multiple_ss_tables".to_string(),
+        path.clone(),
+        100,
+        10,
+        10,
+    )
+    .unwrap();
 
     for i in 0..800 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
@@ -68,7 +75,7 @@ fn test_finds_key_across_multiple_ss_tables() {
 #[test]
 fn load_tree() {
     let path = test_dir("load_tree");
-    let tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
+    let tree = LsmTree::new("load_tree".to_string(), path.clone(), 100, 10, 10).unwrap();
 
     for i in 0..800 {
         tree.insert(format!("key_{i}"), format!("value_{i}"))
@@ -77,7 +84,7 @@ fn load_tree() {
 
     tree.flush().unwrap();
 
-    let tree = LsmTree::<String, String>::load(path).unwrap();
+    let tree = LsmTree::<String, String>::load("load_tree".to_string(), path).unwrap();
 
     let value = tree.get(&"key_12".to_string()).unwrap();
 
@@ -87,7 +94,14 @@ fn load_tree() {
 #[test]
 fn test_compaction_moves_data_to_level_1() {
     let path = test_dir("test_compaction_moves_data_to_level_1");
-    let tree = LsmTree::new(path.clone(), 100, 10, 10).unwrap();
+    let tree = LsmTree::new(
+        "test_compaction_moves_data_to_level_1".to_string(),
+        path.clone(),
+        100,
+        10,
+        10,
+    )
+    .unwrap();
 
     // Produces 5 saved SS Tables, so 15 files
     for i in 0..500 {
@@ -213,7 +227,14 @@ fn test_compaction_works_with_deletion() {
 #[test]
 fn test_list_with_correct_order() {
     let path = test_dir("test_list_with_correct_order");
-    let tree = LsmTree::new(path, 100, 10, 10).unwrap();
+    let tree = LsmTree::new(
+        "test_list_with_correct_order".to_string(),
+        path,
+        100,
+        10,
+        10,
+    )
+    .unwrap();
 
     // let's write 10 keys with index=index, all will go to level1
     // and will add another element just to prove a reading from level1
@@ -277,5 +298,5 @@ fn test_list_prefers_newer_value_across_level0_sstables_even_if_key_rank_differs
 
 fn lsm_three(test_name: &str) -> LsmTree<String, String> {
     let path = test_dir(test_name);
-    LsmTree::new(path, 100, 10, 10).unwrap()
+    LsmTree::new(test_name.to_string(), path, 100, 10, 10).unwrap()
 }

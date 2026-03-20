@@ -33,6 +33,7 @@ pub struct TableConfig {
 
 impl Table {
     pub fn new(
+        name: String,
         schema: TableSchema,
         data_directory: PathBuf,
         TableConfig {
@@ -47,6 +48,7 @@ impl Table {
         let journal = Journal::new(wal_path)?;
 
         let storage = LsmTree::new(
+            name,
             data_directory,
             memtable_size,
             level_0_size,
@@ -60,12 +62,16 @@ impl Table {
         })
     }
 
-    pub fn load(schema: TableSchema, data_directory: PathBuf) -> Result<Self, NornsDbError> {
+    pub fn load(
+        name: String,
+        schema: TableSchema,
+        data_directory: PathBuf,
+    ) -> Result<Self, NornsDbError> {
         let wal_path = data_directory.join("wal.log");
 
         Ok(Self {
             schema: Arc::new(schema),
-            storage: LsmTree::load(data_directory)?,
+            storage: LsmTree::load(name, data_directory)?,
             journal: Journal::new(wal_path)?,
         })
     }
