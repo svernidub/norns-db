@@ -300,6 +300,31 @@ fn test_list_prefers_newer_value_across_level0_sstables_even_if_key_rank_differs
     assert_eq!(k_value, Some("new".to_string()));
 }
 
+#[test]
+fn test_no_data_loss_when_flush_and_compaction_overlap() {
+    // memtable_size=10, level_0_size=3: every 10 inserts → flush; every 3 flushes → compaction.
+    // Writing 500 keys crosses the L0 threshold multiple times, exercising the concurrent
+    // flush+compaction path that previously caused a lost-update data race.
+    let path = test_dir("flush_compaction_overlap");
+    let tree = LsmTree::new("flush_compaction_overlap".to_string(), path, 10, 3, 10, 5).unwrap();
+
+    for i in 0..500 {
+        tree.insert(format!("key_{i}"), format!("value_{i}"))
+            .unwrap();
+    }
+
+    tree.flush_sync().unwrap();
+    tree.compact_sync().unwrap();
+
+    for i in 0..500 {
+        assert_eq!(
+            tree.get(&format!("key_{i}")).unwrap(),
+            Some(format!("value_{i}")),
+            "key_{i} lost after flush+compaction"
+        );
+    }
+}
+
 fn lsm_three(test_name: &str) -> LsmTree<String, String> {
     let path = test_dir(test_name);
     LsmTree::new(test_name.to_string(), path, 100, 10, 10, 2).unwrap()

@@ -12,7 +12,7 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{Receiver, SyncSender, TrySendError},
     },
     time::{Duration, Instant},
@@ -38,6 +38,7 @@ where
     pub(super) metrics_labels: [(&'static str, String); 1],
     pub(super) memtable_size: usize,
     pub(super) compaction_worker: LsmTreeCompactionWorker<K, V>,
+    pub(super) version_lock: Arc<Mutex<()>>,
 }
 
 pub(super) struct LsmTreeFlushWorker<K, V>
@@ -53,6 +54,7 @@ where
     metrics_labels: [(&'static str, String); 1],
     memtable_size: usize,
     compaction_worker: LsmTreeCompactionWorker<K, V>,
+    version_lock: Arc<Mutex<()>>,
     tx: SyncSender<FlushWorkerCommand>,
 }
 
@@ -71,6 +73,7 @@ where
             metrics_labels: self.metrics_labels.clone(),
             memtable_size: self.memtable_size,
             compaction_worker: self.compaction_worker.clone(),
+            version_lock: self.version_lock.clone(),
             tx: self.tx.clone(),
         }
     }
@@ -93,6 +96,7 @@ where
             metrics_labels: params.metrics_labels,
             memtable_size: params.memtable_size,
             compaction_worker: params.compaction_worker,
+            version_lock: params.version_lock,
             tx,
         };
 
@@ -208,12 +212,12 @@ where
             loop {
                 match rx.recv() {
                     Ok(Flush) => {
-                        if let Err(error) = worker.flush_inner() {
+                        if let Err(error) = worker.perform_flushing() {
                             error!(?error, "flush worker failed");
                         }
                     }
                     Ok(FlushSync { tx }) => {
-                        if let Err(error) = worker.flush_inner() {
+                        if let Err(error) = worker.perform_flushing() {
                             error!(?error, "flush worker failed");
                         }
 
@@ -243,7 +247,7 @@ where
         });
     }
 
-    fn flush_inner(&self) -> Result<(), NornsDbError> {
+    fn perform_flushing(&self) -> Result<(), NornsDbError> {
         let (queue_mutex, condvar) = self.frozen_memtables.as_ref();
 
         let mut flushed_any = false;
@@ -260,29 +264,35 @@ where
             let start = Instant::now();
             info!("flushing frozen memtable to SSTable");
 
-            let store = self.current_store_version.load();
+            let new_level_0_count = {
+                let _version_guard = lock_mutex(&self.version_lock);
 
-            let path = self
-                .data_directory
-                .join("level0")
-                .join(store.level_0_ss_tables.len().to_string());
+                let store = self.current_store_version.load();
 
-            let new_table = Arc::new(SsTable::new(
-                (*data).clone(),
-                path,
-                self.ss_table_block_size,
-            )?);
+                let path = self
+                    .data_directory
+                    .join("level0")
+                    .join(store.level_0_ss_tables.len().to_string());
 
-            let mut new_level_0_ss_tables = store.level_0_ss_tables.clone();
-            new_level_0_ss_tables.push(new_table);
-            let new_level_0_count = new_level_0_ss_tables.len();
+                let new_table = Arc::new(SsTable::new(
+                    (*data).clone(),
+                    path,
+                    self.ss_table_block_size,
+                )?);
 
-            self.current_store_version.store(Arc::new(Storage {
-                level_0_ss_tables: new_level_0_ss_tables,
-                level_1_ss_tables: store.level_1_ss_tables.clone(),
-            }));
+                let mut new_level_0_ss_tables = store.level_0_ss_tables.clone();
+                new_level_0_ss_tables.push(new_table);
+                let new_level_0_count = new_level_0_ss_tables.len();
 
-            condvar.notify_one();
+                self.current_store_version.store(Arc::new(Storage {
+                    level_0_ss_tables: new_level_0_ss_tables,
+                    level_1_ss_tables: store.level_1_ss_tables.clone(),
+                }));
+
+                condvar.notify_one();
+
+                new_level_0_count
+            };
 
             histogram!("norns_lsm_flush_duration_ms", &self.metrics_labels)
                 .record(start.elapsed().as_millis() as f64);

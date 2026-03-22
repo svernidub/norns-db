@@ -1,4 +1,4 @@
-use super::{state::State, storage::Storage, value::Value};
+use super::{lock_utils::lock_mutex, state::State, storage::Storage, value::Value};
 use crate::ss_table::SsTable;
 use arc_swap::ArcSwap;
 use dbcore::error::NornsDbError;
@@ -10,7 +10,7 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         mpsc::{Receiver, SyncSender, TrySendError},
     },
     time::{Duration, Instant},
@@ -28,6 +28,7 @@ where
     level_0_size: usize,
     memtable_size: usize,
     metrics_labels: [(&'static str, String); 1],
+    version_lock: Arc<Mutex<()>>,
     tx: SyncSender<CompactionWorkerCommand>,
 }
 
@@ -42,6 +43,7 @@ where
     pub current_store_version: Arc<ArcSwap<Storage<K, V>>>,
     pub metrics_labels: [(&'static str, String); 1],
     pub memtable_size: usize,
+    pub version_lock: Arc<Mutex<()>>,
 }
 
 pub(super) enum CompactionWorkerCommand {
@@ -63,6 +65,7 @@ where
             level_0_size: self.level_0_size,
             memtable_size: self.memtable_size,
             metrics_labels: self.metrics_labels.clone(),
+            version_lock: self.version_lock.clone(),
             tx: self.tx.clone(),
         }
     }
@@ -83,6 +86,7 @@ where
             level_0_size: params.level_0_size,
             memtable_size: params.memtable_size,
             metrics_labels: params.metrics_labels,
+            version_lock: params.version_lock,
             tx,
         };
 
@@ -198,11 +202,15 @@ where
             loop {
                 match rx.recv() {
                     Ok(Compact) => {
-                        if let Err(error) = worker.compact_inner() {
+                        if let Err(error) = worker.perform_compaction() {
                             error!(?error, "compaction worker failed");
                         }
                     }
                     Ok(CompactSync { tx }) => {
+                        if let Err(error) = worker.perform_compaction() {
+                            error!(?error, "compaction worker failed");
+                        }
+
                         if let Err(error) = tx.send(()) {
                             error!(
                                 ?error,
@@ -232,7 +240,9 @@ where
         });
     }
 
-    fn compact_inner(&self) -> Result<(), NornsDbError> {
+    fn perform_compaction(&self) -> Result<(), NornsDbError> {
+        let _version_guard = lock_mutex(&self.version_lock);
+
         let start = Instant::now();
 
         let current = self.current_store_version.load();

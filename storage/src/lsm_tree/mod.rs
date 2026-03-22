@@ -114,6 +114,7 @@ where
             level_0_ss_tables: vec![],
             level_1_ss_tables: vec![],
         }));
+        let version_lock = Arc::new(Mutex::new(()));
 
         let compaction_worker = LsmTreeCompactionWorker::spawn(CompactionWorkerParams {
             data_directory: data_directory.clone(),
@@ -122,6 +123,7 @@ where
             current_store_version: current_store_version.clone(),
             metrics_labels: metrics_labels.clone(),
             memtable_size,
+            version_lock: version_lock.clone(),
         });
 
         let flush_worker = LsmTreeFlushWorker::spawn(FlushWorkerParams {
@@ -133,6 +135,7 @@ where
             metrics_labels: metrics_labels.clone(),
             memtable_size,
             compaction_worker: compaction_worker.clone(),
+            version_lock,
         });
 
         let tree = Self {
@@ -193,6 +196,7 @@ where
             level_0_ss_tables,
             level_1_ss_tables,
         }));
+        let version_lock = Arc::new(Mutex::new(()));
 
         let compaction_worker = LsmTreeCompactionWorker::spawn(CompactionWorkerParams {
             data_directory: data_directory.clone(),
@@ -201,6 +205,7 @@ where
             current_store_version: current_store_version.clone(),
             metrics_labels: metrics_labels.clone(),
             memtable_size,
+            version_lock: version_lock.clone(),
         });
 
         let flush_worker = LsmTreeFlushWorker::spawn(FlushWorkerParams {
@@ -212,6 +217,7 @@ where
             metrics_labels: metrics_labels.clone(),
             memtable_size,
             compaction_worker: compaction_worker.clone(),
+            version_lock,
         });
 
         let tree = Self {
