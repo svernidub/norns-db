@@ -16,6 +16,9 @@ pub struct NornsConfig {
 
     #[envconfig(from = "NORNS_SSTABLE_BLOCK_SIZE", default = "4096")]
     ss_table_block_size: usize,
+
+    #[envconfig(from = "NORNS_MAX_FROZEN_MEMTABLES", default = "2")]
+    max_frozen_memtables: usize,
 }
 
 impl NornsConfig {
@@ -44,6 +47,12 @@ impl NornsConfig {
             ));
         }
 
+        if self.max_frozen_memtables == 0 {
+            return Err(NornsDbError::Config(
+                "NORNS_MAX_FROZEN_MEMTABLES must be > 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -64,6 +73,7 @@ impl NornsConfig {
             memtable_size: self.memtable_size,
             level_0_size: self.level_0_size,
             ss_table_block_size: self.ss_table_block_size,
+            max_frozen_memtables: self.max_frozen_memtables,
         }
     }
 
@@ -77,6 +87,10 @@ impl NornsConfig {
 
     pub fn ss_table_block_size(&self) -> usize {
         self.ss_table_block_size
+    }
+
+    pub fn max_frozen_memtables(&self) -> usize {
+        self.max_frozen_memtables
     }
 }
 

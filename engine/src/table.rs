@@ -29,6 +29,7 @@ pub struct TableConfig {
     pub memtable_size: usize,
     pub level_0_size: usize,
     pub ss_table_block_size: usize,
+    pub max_frozen_memtables: usize,
 }
 
 impl Table {
@@ -40,6 +41,7 @@ impl Table {
             memtable_size,
             level_0_size,
             ss_table_block_size,
+            max_frozen_memtables,
         }: TableConfig,
     ) -> Result<Self, NornsDbError> {
         std::fs::create_dir_all(&data_directory)?;
@@ -53,6 +55,7 @@ impl Table {
             memtable_size,
             level_0_size,
             ss_table_block_size,
+            max_frozen_memtables,
         )?;
 
         Ok(Self {
@@ -66,12 +69,13 @@ impl Table {
         name: String,
         schema: TableSchema,
         data_directory: PathBuf,
+        max_frozen_memtables: usize,
     ) -> Result<Self, NornsDbError> {
         let wal_path = data_directory.join("wal.log");
 
         Ok(Self {
             schema: Arc::new(schema),
-            storage: LsmTree::load(name, data_directory)?,
+            storage: LsmTree::load(name, data_directory, max_frozen_memtables)?,
             journal: Journal::new(wal_path)?,
         })
     }
@@ -105,7 +109,7 @@ impl Table {
         self.storage.list()
     }
 
-    pub async fn delete(&self, primary_key: PrimaryKey) -> Result<Option<Row>, NornsDbError> {
+    pub async fn delete(&self, primary_key: PrimaryKey) -> Result<(), NornsDbError> {
         let record = JournalRecord::new(JournalRecordKind::Delete {
             key: primary_key.clone(),
         });
