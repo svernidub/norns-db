@@ -248,6 +248,12 @@ where
         let current = self.current_store_version.load();
 
         let l0_count = current.level_0_ss_tables.len();
+
+        if l0_count == 0 {
+            debug!("no L0 tables to compact, skipping");
+            return Ok(());
+        }
+
         info!(l0_tables = l0_count, "starting L0 -> L1 compaction");
 
         let iters = current
