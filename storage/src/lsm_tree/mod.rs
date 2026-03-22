@@ -1,87 +1,80 @@
+mod compaction_worker;
+mod flush_worker;
+mod frozen_memtables;
+mod lock_utils;
+mod state;
+mod storage;
 #[cfg(test)]
 mod tests;
+mod value;
 
 use crate::ss_table::SsTable;
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
+use compaction_worker::{CompactionWorkerParams, LsmTreeCompactionWorker};
 use dbcore::error::NornsDbError;
+use flush_worker::{FlushWorkerParams, LsmTreeFlushWorker};
+use frozen_memtables::FrozenMemtables;
 use itertools::Itertools;
+use lock_utils::{lock_mutex, lock_read, lock_write};
 use metrics::{gauge, histogram};
+use state::State;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     fs::File,
     hash::Hash,
-    io::{BufReader, BufWriter, Write},
+    io::BufReader,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Arc, Condvar, Mutex, RwLock},
     time::Instant,
 };
-use tracing::{debug, info, instrument, trace};
+use storage::Storage;
+use tracing::{debug, instrument, trace};
+use value::Value;
 
 pub struct LsmTree<K, V>
 where
-    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()>,
-    V: Clone + bincode::Encode + bincode::Decode<()>,
+    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
 {
-    table_name: String,
-    memtable: RwLock<BTreeMap<K, Value<V>>>,
+    memtable: Arc<RwLock<BTreeMap<K, Value<V>>>>,
     memtable_size: usize,
     data_directory: PathBuf,
-    ss_table_block_size: usize,
-    level_0_size: usize,
+    max_frozen_memtables: usize,
 
-    // A place where we dump the main memtable when it's full. A buffer for flushing on
-    // disk, accessible for readers.
-    frozen_memtable: ArcSwapOption<BTreeMap<K, Value<V>>>,
+    // Queue of frozen (full) memtables waiting to be flushed to L0 SSTables.
+    // The Condvar is notified after each flush, so writers waiting a slot in a full queue can
+    // proceed.
+    frozen_memtables: FrozenMemtables<K, V>,
 
-    // Data is dumped on disc with CoW principle, so all readers are not blocked.
-    // But concurrent writes may be blocked during a flush & compaction.
-    store_lock: Mutex<()>,
-    current_store_version: ArcSwap<Storage<K, V>>,
-}
+    compaction_worker: LsmTreeCompactionWorker<K, V>,
+    flush_worker: LsmTreeFlushWorker<K, V>,
+    current_store_version: Arc<ArcSwap<Storage<K, V>>>,
 
-struct Storage<K, V>
-where
-    V: Clone,
-{
-    level_0_ss_tables: Vec<Arc<SsTable<K, Value<V>>>>,
-    level_1_ss_tables: Vec<Arc<SsTable<K, Value<V>>>>,
-}
-
-#[derive(bincode::Encode, bincode::Decode)]
-struct State {
-    ss_table_block_size: usize,
-    memtable_size: usize,
-    level_0_ss_tables: usize,
-    level_1_ss_tables: usize,
-    level_0_size: usize,
-}
-
-#[derive(bincode::Encode, bincode::Decode, Clone)]
-enum Value<T>
-where
-    T: Clone,
-{
-    Data(T),
-    Tombstone,
+    metrics_labels: [(&'static str, String); 1],
 }
 
 impl<K, V> Drop for LsmTree<K, V>
 where
-    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()>,
-    V: Clone + bincode::Encode + bincode::Decode<()>,
+    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
 {
     fn drop(&mut self) {
         debug!(dir = %self.data_directory.display(), "LSM tree shutting down, flushing memtable");
-        if let Err(e) = self.flush() {
+
+        if let Err(e) = self.flush_sync() {
             debug!(error = %e, "failed to flush memtable on drop");
+        }
+
+        if let Err(e) = self.stop() {
+            debug!(error = %e, "failed to stop flush worker on drop");
         }
     }
 }
 
 impl<K, V> LsmTree<K, V>
 where
-    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()>,
-    V: Clone + bincode::Encode + bincode::Decode<()>,
+    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
 {
     pub fn new(
         table_name: String,
@@ -89,10 +82,11 @@ where
         memtable_size: usize,
         level_0_size: usize,
         ss_table_block_size: usize,
+        max_frozen_memtables: usize,
     ) -> Result<Self, NornsDbError> {
         let data_directory = data_directory.into();
 
-        assert!(
+        debug_assert!(
             !std::fs::exists(data_directory.join("state"))?,
             "LSM tree already initialized at {}, use load() instead",
             data_directory.display()
@@ -106,34 +100,61 @@ where
             memtable_size,
             level_0_size,
             ss_table_block_size,
+            max_frozen_memtables,
             "LSM tree created"
         );
 
-        gauge!("norns_lsm_l0_tables", "table_name" => table_name.clone()).set(0.0);
-        gauge!("norns_lsm_l1_tables", "table_name" => table_name.clone()).set(0.0);
+        let metrics_labels = [("table_name", table_name)];
+
+        gauge!("norns_lsm_l0_tables", &metrics_labels).set(0.0);
+        gauge!("norns_lsm_l1_tables", &metrics_labels).set(0.0);
+
+        let frozen_memtables = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let current_store_version = Arc::new(ArcSwap::from_pointee(Storage {
+            level_0_ss_tables: vec![],
+            level_1_ss_tables: vec![],
+        }));
+
+        let compaction_worker = LsmTreeCompactionWorker::spawn(CompactionWorkerParams {
+            data_directory: data_directory.clone(),
+            ss_table_block_size,
+            level_0_size,
+            current_store_version: current_store_version.clone(),
+            metrics_labels: metrics_labels.clone(),
+            memtable_size,
+        });
+
+        let flush_worker = LsmTreeFlushWorker::spawn(FlushWorkerParams {
+            frozen_memtables: frozen_memtables.clone(),
+            data_directory: data_directory.clone(),
+            ss_table_block_size,
+            level_0_size,
+            current_store_version: current_store_version.clone(),
+            metrics_labels: metrics_labels.clone(),
+            memtable_size,
+            compaction_worker: compaction_worker.clone(),
+        });
 
         let tree = Self {
-            table_name,
-            memtable: RwLock::new(BTreeMap::new()),
+            metrics_labels,
+            memtable: Arc::new(RwLock::new(BTreeMap::new())),
             memtable_size,
             data_directory,
-            ss_table_block_size,
-            current_store_version: ArcSwap::from_pointee(Storage {
-                level_0_ss_tables: vec![],
-                level_1_ss_tables: vec![],
-            }),
-            level_0_size,
-            frozen_memtable: ArcSwapOption::empty(),
-            store_lock: Mutex::new(()),
+            current_store_version,
+            max_frozen_memtables,
+            frozen_memtables,
+            compaction_worker,
+            flush_worker,
         };
 
-        tree.save_state()?;
+        tree.flush_worker.save_state()?;
         Ok(tree)
     }
 
     pub fn load(
         table_name: String,
         data_directory: impl Into<PathBuf>,
+        max_frozen_memtables: usize,
     ) -> Result<Self, NornsDbError> {
         let data_directory = data_directory.into();
         debug!(dir = %data_directory.display(), "loading LSM tree");
@@ -153,6 +174,7 @@ where
             memtable_size,
             level_0_size,
             ss_table_block_size,
+            max_frozen_memtables,
             l0_tables = level_0_ss_tables,
             l1_tables = level_1_ss_tables,
             "LSM tree state loaded"
@@ -161,25 +183,50 @@ where
         let level_0_ss_tables = Self::load_level(&data_directory, "level0", level_0_ss_tables)?;
         let level_1_ss_tables = Self::load_level(&data_directory, "level1", level_1_ss_tables)?;
 
-        gauge!("norns_lsm_l0_tables", "table_name" => table_name.clone())
-            .set(level_0_ss_tables.len() as f64);
-        gauge!("norns_lsm_l1_tables", "table_name" => table_name.clone())
-            .set(level_1_ss_tables.len() as f64);
+        let metrics_labels = [("table_name", table_name)];
 
-        Ok(Self {
-            table_name,
-            memtable: RwLock::new(BTreeMap::new()),
-            memtable_size,
-            data_directory,
+        gauge!("norns_lsm_l0_tables", &metrics_labels).set(level_0_ss_tables.len() as f64);
+        gauge!("norns_lsm_l1_tables", &metrics_labels).set(level_1_ss_tables.len() as f64);
+
+        let frozen_memtables = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let current_store_version = Arc::new(ArcSwap::from_pointee(Storage {
+            level_0_ss_tables,
+            level_1_ss_tables,
+        }));
+
+        let compaction_worker = LsmTreeCompactionWorker::spawn(CompactionWorkerParams {
+            data_directory: data_directory.clone(),
             ss_table_block_size,
             level_0_size,
-            frozen_memtable: ArcSwapOption::empty(),
-            store_lock: Mutex::new(()),
-            current_store_version: ArcSwap::from_pointee(Storage {
-                level_0_ss_tables,
-                level_1_ss_tables,
-            }),
-        })
+            current_store_version: current_store_version.clone(),
+            metrics_labels: metrics_labels.clone(),
+            memtable_size,
+        });
+
+        let flush_worker = LsmTreeFlushWorker::spawn(FlushWorkerParams {
+            frozen_memtables: frozen_memtables.clone(),
+            data_directory: data_directory.clone(),
+            ss_table_block_size,
+            level_0_size,
+            current_store_version: current_store_version.clone(),
+            metrics_labels: metrics_labels.clone(),
+            memtable_size,
+            compaction_worker: compaction_worker.clone(),
+        });
+
+        let tree = Self {
+            metrics_labels,
+            memtable: Arc::new(RwLock::new(BTreeMap::new())),
+            memtable_size,
+            data_directory,
+            max_frozen_memtables,
+            frozen_memtables,
+            compaction_worker,
+            flush_worker,
+            current_store_version,
+        };
+
+        Ok(tree)
     }
 
     #[instrument(skip(self))]
@@ -230,24 +277,24 @@ where
 
         let memtable_iterator = build_inmemory_iterator(memtable, 0);
 
-        let frozen_memtable = {
-            let frozen_memtable = self.frozen_memtable.load();
-            frozen_memtable.as_ref().map(|mt| (**mt).clone())
+        let frozen_snapshot: Vec<Arc<BTreeMap<K, Value<V>>>> = {
+            let (queue_mutex, _) = self.frozen_memtables.as_ref();
+            lock_mutex(queue_mutex).iter().cloned().collect()
         };
-
-        let frozen_memtable_iterator = frozen_memtable
-            .map(|mt| build_inmemory_iterator(mt, 1))
-            .unwrap_or_else(|| {
-                Box::new(std::iter::empty())
-                    as Box<dyn Iterator<Item = (u8, usize, Result<(K, V), NornsDbError>)>>
-            });
+        let frozen_iterators: Vec<_> = frozen_snapshot
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, frozen)| build_inmemory_iterator((**frozen).clone(), i + 1))
+            .collect();
 
         let current_store_version = self.current_store_version.load();
 
         let level0_iterators = build_fs_iterators(&current_store_version.level_0_ss_tables, 0)?;
         let level1_iterators = build_fs_iterators(&current_store_version.level_1_ss_tables, 1)?;
 
-        let mut iterators = vec![memtable_iterator, frozen_memtable_iterator];
+        let mut iterators = vec![memtable_iterator];
+        iterators.extend(frozen_iterators);
         iterators.extend(level0_iterators);
         iterators.extend(level1_iterators);
 
@@ -286,25 +333,11 @@ where
     #[instrument(skip(self, key, value))]
     pub fn insert(&self, key: K, value: V) -> Result<(), NornsDbError> {
         let start = Instant::now();
-
-        let needs_flush = {
-            let memtable = lock_read(&self.memtable);
-            memtable.len() >= self.memtable_size
-        };
-
-        if needs_flush {
-            debug!("memtable full, triggering flush before insert");
-            self.flush()?;
-        }
-
         trace!("inserting key into memtable");
-        let _size = {
-            let mut memtable = lock_write(&self.memtable);
-            memtable.insert(key, Value::Data(value));
-            memtable.len()
-        };
 
-        histogram!("norns_lsm_insert_duration_us", "table_name" => self.table_name.clone())
+        self.write_value(key, Value::Data(value))?;
+
+        histogram!("norns_lsm_insert_duration_us", &self.metrics_labels)
             .record(start.elapsed().as_micros() as f64);
 
         Ok(())
@@ -326,17 +359,15 @@ where
                 }
             }
 
-            {
-                let frozen_memtable = self.frozen_memtable.load();
-
-                let maybe_value = frozen_memtable
-                    .as_ref()
-                    .and_then(|frozen_mt| frozen_mt.get(key).cloned());
-
-                if let Some(value) = maybe_value {
+            let frozen_snapshot: Vec<Arc<BTreeMap<K, Value<V>>>> = {
+                let (queue_mutex, _) = self.frozen_memtables.as_ref();
+                lock_mutex(queue_mutex).iter().cloned().collect()
+            };
+            for frozen in frozen_snapshot.iter().rev() {
+                if let Some(value) = frozen.get(key) {
                     trace!("key found in frozen memtable");
                     return match value {
-                        Value::Data(d) => Ok(Some(d)),
+                        Value::Data(d) => Ok(Some(d.clone())),
                         Value::Tombstone => Ok(None),
                     };
                 }
@@ -344,136 +375,101 @@ where
 
             let current_store_version = self.current_store_version.load();
 
-            if let Some(value) =
+            if let Some(maybe_value) =
                 self.lookup_in_level(&current_store_version.level_0_ss_tables, key)?
             {
                 trace!("key found in L0 SSTables");
-                return Ok(Some(value));
+                return Ok(maybe_value);
             }
 
-            if let Some(value) =
+            if let Some(maybe_value) =
                 self.lookup_in_level(&current_store_version.level_1_ss_tables, key)?
             {
                 trace!("key found in L1 SSTables");
-                return Ok(Some(value));
+                return Ok(maybe_value);
             }
 
             trace!("key not found in any level");
             Ok(None)
         })();
 
-        histogram!("norns_lsm_get_duration_us", "table_name" => self.table_name.clone())
+        histogram!("norns_lsm_get_duration_us", &self.metrics_labels)
             .record(start.elapsed().as_micros() as f64);
 
         result
     }
 
-    fn lookup_in_level(
-        &self,
-        level: &[Arc<SsTable<K, Value<V>>>],
-        key: &K,
-    ) -> Result<Option<V>, NornsDbError> {
-        for ss_table in level.iter().rev() {
-            if let Some(value) = ss_table.get(key)? {
-                return match value {
-                    Value::Data(d) => Ok(Some(d)),
-                    Value::Tombstone => Ok(None),
-                };
-            }
-        }
-
-        Ok(None)
-    }
-
-    pub fn delete(&self, key: K) -> Result<Option<V>, NornsDbError> {
-        let value = self.get(&key)?;
-        if value.is_none() {
-            debug!("delete: key not found, skipping");
-            return Ok(None);
-        }
-
-        let needs_flush = {
-            let memtable = lock_read(&self.memtable);
-            memtable.len() >= self.memtable_size
-        };
-
-        if needs_flush {
-            debug!("memtable full, triggering flush before delete");
-            self.flush()?;
-        }
-
-        debug!("writing tombstone for key");
-        let mut memtable = lock_write(&self.memtable);
-        memtable.insert(key, Value::Tombstone);
-
-        Ok(value)
-    }
-
-    pub fn flush(&self) -> Result<(), NornsDbError> {
+    #[instrument(skip(self, key))]
+    pub fn delete(&self, key: K) -> Result<(), NornsDbError> {
         let start = Instant::now();
+        debug!("writing tombstone for key");
 
-        let _guard = self.store_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.write_value(key, Value::Tombstone)?;
 
-        let data = {
-            let mut memtable = lock_write(&self.memtable);
-            if memtable.is_empty() {
-                debug!("flush called but memtable is empty, skipping");
-                return Ok(());
-            }
+        histogram!("norns_lsm_delete_duration_us", &self.metrics_labels)
+            .record(start.elapsed().as_micros() as f64);
 
-            info!("flushing memtable to SSTable");
-
-            let data = std::mem::take(&mut *memtable);
-            self.frozen_memtable.store(Some(Arc::new(data.clone())));
-            data
-        };
-
-        let current_store_version = self.current_store_version.load();
-
-        let path = self
-            .data_directory
-            .join("level0")
-            .join(current_store_version.level_0_ss_tables.len().to_string());
-
-        let new_table = SsTable::new(data, &path, self.ss_table_block_size)?;
-
-        let mut new_level_0_ss_tables = current_store_version.level_0_ss_tables.clone();
-        new_level_0_ss_tables.push(new_table.into());
-        let level0_size = new_level_0_ss_tables.len();
-
-        let needs_compaction = new_level_0_ss_tables.len() == self.level_0_size;
-
-        self.current_store_version.store(Arc::new(Storage {
-            level_0_ss_tables: new_level_0_ss_tables,
-            level_1_ss_tables: current_store_version.level_1_ss_tables.clone(),
-        }));
-
-        self.frozen_memtable.store(None);
-
-        histogram!("norns_lsm_flush_duration_ms", "table_name" => self.table_name.clone())
-            .record(start.elapsed().as_millis() as f64);
-
-        gauge!("norns_lsm_l0_tables", "table_name" => self.table_name.clone())
-            .set(level0_size as f64);
-
-        info!("memtable flushed to L0 SSTable");
-
-        if needs_compaction {
-            debug!(
-                l0_tables = self.level_0_size,
-                "L0 full, triggering compaction"
-            );
-            self.compact_inner()?;
-        }
-
-        self.save_state()?;
         Ok(())
     }
 
-    pub fn compact(&self) -> Result<(), NornsDbError> {
-        let _guard = self.store_lock.lock().unwrap_or_else(|e| e.into_inner());
+    pub fn flush(&self) -> Result<(), NornsDbError> {
+        self.flush_worker.flush()
+    }
 
-        self.compact_inner()
+    pub fn flush_sync(&self) -> Result<(), NornsDbError> {
+        // Rotate the active memtable into the frozen queue if it has data.
+        // This ensures flush_sync persists everything, not just previously rotated memtables.
+        {
+            let mut memtable = lock_write(&self.memtable);
+            if !memtable.is_empty() {
+                let (queue_mutex, condvar) = self.frozen_memtables.as_ref();
+                let mut queue = lock_mutex(queue_mutex);
+                while queue.len() >= self.max_frozen_memtables {
+                    queue = condvar.wait(queue).unwrap_or_else(|e| e.into_inner());
+                }
+                let frozen = Arc::new(std::mem::take(&mut *memtable));
+                queue.push_back(frozen);
+            }
+        }
+
+        self.flush_worker.flush_sync()
+    }
+
+    pub fn compact_sync(&self) -> Result<(), NornsDbError> {
+        self.compaction_worker.compact_sync()
+    }
+
+    pub fn destroy(self) -> Result<(), NornsDbError> {
+        let dir = self.data_directory.clone();
+        drop(self);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    fn write_value(&self, key: K, value: Value<V>) -> Result<(), NornsDbError> {
+        let should_flush = {
+            let mut memtable = lock_write(&self.memtable);
+            memtable.insert(key, value);
+            if memtable.len() >= self.memtable_size {
+                let (queue_mutex, condvar) = self.frozen_memtables.as_ref();
+                let mut queue = lock_mutex(queue_mutex);
+                while queue.len() >= self.max_frozen_memtables {
+                    queue = condvar.wait(queue).unwrap_or_else(|e| e.into_inner());
+                }
+                let frozen = Arc::new(std::mem::take(&mut *memtable));
+                queue.push_back(frozen);
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_flush {
+            debug!("memtable full, triggering flush");
+            self.flush()?;
+        }
+
+        Ok(())
     }
 
     // FIXME: deal with this later
@@ -494,126 +490,25 @@ where
         Ok(level_ss_tables)
     }
 
-    /// Must be called with store_lock held.
-    fn compact_inner(&self) -> Result<(), NornsDbError> {
-        let start = Instant::now();
-
-        let current = self.current_store_version.load();
-
-        let l0_count = current.level_0_ss_tables.len();
-        info!(l0_tables = l0_count, "starting L0 -> L1 compaction");
-
-        let iters = current
-            .level_0_ss_tables
-            .iter()
-            .map(|ss_table| ss_table.iter())
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Actual compaction happens here, an implementation of FromIterator for BTreeMap takes
-        // only the last (so most recent) item from the iterator.
-        let compacted_level = iters
-            .into_iter()
-            .flatten()
-            .collect::<Result<BTreeMap<K, Value<V>>, _>>()?;
-
-        // TODO: We write all retained Tombstones here, without understanding if there were some
-        //       values on level 1 before. Need to find a way to cleanup Tombstones without a
-        //       corresponding values on deeper levels.
-
-        let path = self
-            .data_directory
-            .join("level1")
-            .join(current.level_1_ss_tables.len().to_string());
-
-        let new_lower_level_table = SsTable::new(compacted_level, &path, self.ss_table_block_size)?;
-
-        let level_0 = self.data_directory.join("level0");
-
-        for file in std::fs::read_dir(level_0)? {
-            let file = file?;
-            let path = file.path();
-            trace!(path = %path.display(), "removing old L0 file");
-            std::fs::remove_file(path)?;
+    fn lookup_in_level(
+        &self,
+        level: &[Arc<SsTable<K, Value<V>>>],
+        key: &K,
+    ) -> Result<Option<Option<V>>, NornsDbError> {
+        for ss_table in level.iter().rev() {
+            if let Some(value) = ss_table.get(key)? {
+                return match value {
+                    Value::Data(d) => Ok(Some(Some(d))),
+                    Value::Tombstone => Ok(Some(None)),
+                };
+            }
         }
 
-        let mut new_level_1 = current.level_1_ss_tables.clone();
-        new_level_1.push(new_lower_level_table.into());
-
-        self.current_store_version.store(Arc::new(Storage {
-            level_0_ss_tables: Vec::new(),
-            level_1_ss_tables: new_level_1,
-        }));
-
-        self.save_state()?;
-
-        histogram!("norns_lsm_l0_compaction_duration_ms", "table_name" => self.table_name.clone())
-            .record(start.elapsed().as_millis() as f64);
-
-        let store = self.current_store_version.load();
-        gauge!("norns_lsm_l0_tables", "table_name" => self.table_name.clone())
-            .set(store.level_0_ss_tables.len() as f64);
-
-        gauge!("norns_lsm_l1_tables", "table_name" => self.table_name.clone())
-            .set(store.level_1_ss_tables.len() as f64);
-
-        info!(
-            l0_compacted = l0_count,
-            l1_tables = store.level_1_ss_tables.len(),
-            "compaction complete"
-        );
-
-        Ok(())
+        Ok(None)
     }
 
-    pub fn destroy(self) -> Result<(), NornsDbError> {
-        // Prevent from flushing memtable to a disk.
-        {
-            lock_write(&self.memtable).clear();
-        }
-
-        let dir = self.data_directory.clone();
-        drop(self);
-        std::fs::remove_dir_all(&dir)?;
-        Ok(())
+    fn stop(&self) -> Result<(), NornsDbError> {
+        self.flush_worker.stop()?;
+        self.compaction_worker.stop()
     }
-
-    fn save_state(&self) -> Result<(), NornsDbError> {
-        let tmp_path = self.data_directory.join("state.tmp");
-
-        let temp_file = File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(&temp_file);
-
-        let current_store_version = self.current_store_version.load();
-
-        let state = State {
-            ss_table_block_size: self.ss_table_block_size,
-            memtable_size: self.memtable_size,
-            level_0_ss_tables: current_store_version.level_0_ss_tables.len(),
-            level_1_ss_tables: current_store_version.level_1_ss_tables.len(),
-            level_0_size: self.level_0_size,
-        };
-
-        debug!(
-            l0_tables = state.level_0_ss_tables,
-            l1_tables = state.level_1_ss_tables,
-            "saving LSM tree state"
-        );
-
-        let encoded_state = bincode::encode_to_vec(state, bincode::config::standard())?;
-
-        writer.write_all(encoded_state.as_slice())?;
-        writer.flush()?;
-        temp_file.sync_all()?;
-
-        std::fs::rename(tmp_path, self.data_directory.join("state"))?;
-        Ok(())
-    }
-}
-
-fn lock_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(|e| e.into_inner())
-}
-
-fn lock_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|e| e.into_inner())
 }

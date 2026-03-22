@@ -21,6 +21,7 @@ fn test_config() -> DatabaseConfig {
         memtable_size: 64,
         level_0_size: 4,
         ss_table_block_size: 256,
+        max_frozen_memtables: 2,
     }
 }
 
@@ -195,8 +196,7 @@ async fn test_delete_with_missing_key() {
     let db = Database::new(test_dir("test_delete_with_missing_key"), test_config()).unwrap();
     db.create_table("users", users_schema()).await.unwrap();
 
-    let result = db.delete("users", PrimaryKey::Integer(999)).await.unwrap();
-    assert!(result.is_none());
+    db.delete("users", PrimaryKey::Integer(999)).await.unwrap();
 }
 
 #[tokio::test]

@@ -131,9 +131,7 @@ pub async fn delete_row(
     let primary_key =
         models::parse_primary_key(&key, schema.primary_key_type).map_err(ApiError::BadRequest)?;
 
-    db.delete(&table_name, primary_key)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    db.delete(&table_name, primary_key).await?;
 
     histogram!("norns_api_delete_duration_us", "table_name" => table_name)
         .record(start.elapsed().as_micros() as f64);

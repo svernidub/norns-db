@@ -38,6 +38,7 @@ pub struct DatabaseConfig {
     pub memtable_size: usize,
     pub level_0_size: usize,
     pub ss_table_block_size: usize,
+    pub max_frozen_memtables: usize,
 }
 
 impl From<DatabaseConfig> for TableConfig {
@@ -46,12 +47,14 @@ impl From<DatabaseConfig> for TableConfig {
             memtable_size,
             level_0_size,
             ss_table_block_size,
+            max_frozen_memtables,
         } = config;
 
         Self {
             memtable_size,
             level_0_size,
             ss_table_block_size,
+            max_frozen_memtables,
         }
     }
 }
@@ -84,7 +87,12 @@ impl Database {
 
         for (name, table_schema) in schema.tables {
             let table_dir = data_directory.join(&name);
-            let table = Table::load(name.clone(), table_schema, table_dir)?;
+            let table = Table::load(
+                name.clone(),
+                table_schema,
+                table_dir,
+                config.max_frozen_memtables,
+            )?;
             tables.insert(name, table);
         }
 
@@ -124,6 +132,7 @@ impl Database {
 
     pub async fn drop_table(&self, name: impl Into<String>) -> Result<(), NornsDbError> {
         let name = name.into();
+
         let mut tables = self.tables.write().await;
 
         let table = tables
@@ -155,7 +164,7 @@ impl Database {
         table.get(key)
     }
 
-    pub async fn delete(&self, table: &str, key: PrimaryKey) -> Result<Option<Row>, NornsDbError> {
+    pub async fn delete(&self, table: &str, key: PrimaryKey) -> Result<(), NornsDbError> {
         let tables = self.tables.read().await;
         let table = tables
             .get(table)
@@ -203,7 +212,7 @@ impl Database {
         let encoded = bincode::encode_to_vec(schema, bincode::config::standard())?;
 
         let tmp_path = self.data_directory.join("schema.tmp");
-        let tmp_file = File::create(self.data_directory.join("schema.tmp"))?;
+        let tmp_file = File::create(&tmp_path)?;
 
         let mut writer = BufWriter::new(&tmp_file);
         writer.write_all(&encoded)?;
