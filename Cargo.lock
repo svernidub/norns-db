@@ -406,6 +406,7 @@ dependencies = [
  "journal",
  "storage",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1743,6 +1744,7 @@ dependencies = [
  "itertools",
  "metrics",
  "siphasher",
+ "tokio",
  "tracing",
 ]
 

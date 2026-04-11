@@ -17,11 +17,7 @@ use std::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-pub(super) struct LsmTreeCompactionWorker<K, V>
-where
-    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-    V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-{
+pub(super) struct LsmTreeCompactionWorker<K, V> {
     current_store_version: Arc<ArcSwap<Storage<K, V>>>,
     data_directory: PathBuf,
     ss_table_block_size: usize,
@@ -32,11 +28,7 @@ where
     tx: SyncSender<CompactionWorkerCommand>,
 }
 
-pub(super) struct CompactionWorkerParams<K, V>
-where
-    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-    V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-{
+pub(super) struct CompactionWorkerParams<K, V> {
     pub data_directory: PathBuf,
     pub ss_table_block_size: usize,
     pub level_0_size: usize,

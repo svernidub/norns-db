@@ -1,3 +1,4 @@
+mod active_memtable;
 mod compaction_worker;
 mod flush_worker;
 mod frozen_memtables;
@@ -9,6 +10,7 @@ mod tests;
 mod value;
 
 use crate::ss_table::SsTable;
+use active_memtable::ActiveMemtable;
 use arc_swap::ArcSwap;
 use compaction_worker::{CompactionWorkerParams, LsmTreeCompactionWorker};
 use dbcore::error::NornsDbError;
@@ -28,15 +30,17 @@ use std::{
     time::Instant,
 };
 use storage::Storage;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, instrument, trace};
 use value::Value;
 
-pub struct LsmTree<K, V>
+pub struct LsmTree<K, V, H>
 where
     K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
     V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    H: Clone + Send + Sync + 'static + std::fmt::Debug,
 {
-    memtable: Arc<RwLock<BTreeMap<K, Value<V>>>>,
+    memtable: Arc<RwLock<ActiveMemtable<K, V, H>>>,
     memtable_size: usize,
     data_directory: PathBuf,
     max_frozen_memtables: usize,
@@ -44,19 +48,20 @@ where
     // Queue of frozen (full) memtables waiting to be flushed to L0 SSTables.
     // The Condvar is notified after each flush, so writers waiting a slot in a full queue can
     // proceed.
-    frozen_memtables: FrozenMemtables<K, V>,
+    frozen_memtables: FrozenMemtables<K, V, H>,
 
     compaction_worker: LsmTreeCompactionWorker<K, V>,
-    flush_worker: LsmTreeFlushWorker<K, V>,
+    flush_worker: LsmTreeFlushWorker<K, V, H>,
     current_store_version: Arc<ArcSwap<Storage<K, V>>>,
 
     metrics_labels: [(&'static str, String); 1],
 }
 
-impl<K, V> Drop for LsmTree<K, V>
+impl<K, V, H> Drop for LsmTree<K, V, H>
 where
     K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
     V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    H: Clone + Send + Sync + 'static + std::fmt::Debug,
 {
     fn drop(&mut self) {
         debug!(dir = %self.data_directory.display(), "LSM tree shutting down, flushing memtable");
@@ -71,10 +76,11 @@ where
     }
 }
 
-impl<K, V> LsmTree<K, V>
+impl<K, V, H> LsmTree<K, V, H>
 where
     K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
     V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    H: Clone + Send + Sync + 'static + std::fmt::Debug,
 {
     pub fn new(
         table_name: String,
@@ -83,6 +89,7 @@ where
         level_0_size: usize,
         ss_table_block_size: usize,
         max_frozen_memtables: usize,
+        commit_tx: UnboundedSender<H>,
     ) -> Result<Self, NornsDbError> {
         let data_directory = data_directory.into();
 
@@ -136,18 +143,19 @@ where
             memtable_size,
             compaction_worker: compaction_worker.clone(),
             version_lock,
+            commit_tx,
         });
 
         let tree = Self {
             metrics_labels,
-            memtable: Arc::new(RwLock::new(BTreeMap::new())),
+            memtable: Arc::new(RwLock::new(ActiveMemtable::Empty)),
             memtable_size,
             data_directory,
-            current_store_version,
             max_frozen_memtables,
             frozen_memtables,
             compaction_worker,
             flush_worker,
+            current_store_version,
         };
 
         tree.flush_worker.save_state()?;
@@ -158,6 +166,7 @@ where
         table_name: String,
         data_directory: impl Into<PathBuf>,
         max_frozen_memtables: usize,
+        commit_tx: UnboundedSender<H>,
     ) -> Result<Self, NornsDbError> {
         let data_directory = data_directory.into();
         debug!(dir = %data_directory.display(), "loading LSM tree");
@@ -218,11 +227,12 @@ where
             memtable_size,
             compaction_worker: compaction_worker.clone(),
             version_lock,
+            commit_tx,
         });
 
-        let tree = Self {
+        Ok(Self {
             metrics_labels,
-            memtable: Arc::new(RwLock::new(BTreeMap::new())),
+            memtable: Arc::new(RwLock::new(ActiveMemtable::Empty)),
             memtable_size,
             data_directory,
             max_frozen_memtables,
@@ -230,9 +240,7 @@ where
             compaction_worker,
             flush_worker,
             current_store_version,
-        };
-
-        Ok(tree)
+        })
     }
 
     #[instrument(skip(self))]
@@ -266,7 +274,6 @@ where
         let build_inmemory_iterator = |memtable: BTreeMap<K, Value<V>>, priority: usize| {
             Box::new(
                 memtable
-                    .clone()
                     .into_iter()
                     .filter_map(|kv| match kv {
                         (k, Value::Data(v)) => Some(Ok::<_, NornsDbError>((k, v))),
@@ -276,22 +283,27 @@ where
             ) as Box<dyn Iterator<Item = (u8, usize, Result<(K, V), NornsDbError>)>>
         };
 
-        let memtable = {
-            let memtable = lock_read(&self.memtable);
-            memtable.clone()
+        let memtable_data = {
+            let active = lock_read(&self.memtable);
+            match &*active {
+                ActiveMemtable::Empty => BTreeMap::new(),
+                ActiveMemtable::NonEmpty { data, .. } => data.clone(),
+            }
         };
+        let memtable_iterator = build_inmemory_iterator(memtable_data, 0);
 
-        let memtable_iterator = build_inmemory_iterator(memtable, 0);
-
-        let frozen_snapshot: Vec<Arc<BTreeMap<K, Value<V>>>> = {
+        let frozen_snapshot: Vec<BTreeMap<K, Value<V>>> = {
             let (queue_mutex, _) = self.frozen_memtables.as_ref();
-            lock_mutex(queue_mutex).iter().cloned().collect()
+            lock_mutex(queue_mutex)
+                .iter()
+                .map(|f| f.data.clone())
+                .collect()
         };
         let frozen_iterators: Vec<_> = frozen_snapshot
-            .iter()
+            .into_iter()
             .rev()
             .enumerate()
-            .map(|(i, frozen)| build_inmemory_iterator((**frozen).clone(), i + 1))
+            .map(|(i, frozen_data)| build_inmemory_iterator(frozen_data, i + 1))
             .collect();
 
         let current_store_version = self.current_store_version.load();
@@ -318,6 +330,10 @@ where
                     return true;
                 }
 
+                if level0 == level1 && p0 < p1 {
+                    return true;
+                }
+
                 p0 < p1
             })
             .map(|(_, _, kv)| kv)
@@ -337,11 +353,11 @@ where
     }
 
     #[instrument(skip(self, key, value))]
-    pub fn insert(&self, key: K, value: V) -> Result<(), NornsDbError> {
+    pub fn insert(&self, key: K, value: V, handle: H) -> Result<(), NornsDbError> {
         let start = Instant::now();
         trace!("inserting key into memtable");
 
-        self.write_value(key, Value::Data(value))?;
+        self.write_value(key, Value::Data(value), handle)?;
 
         histogram!("norns_lsm_insert_duration_us", &self.metrics_labels)
             .record(start.elapsed().as_micros() as f64);
@@ -365,9 +381,12 @@ where
                 }
             }
 
-            let frozen_snapshot: Vec<Arc<BTreeMap<K, Value<V>>>> = {
+            let frozen_snapshot: Vec<BTreeMap<K, Value<V>>> = {
                 let (queue_mutex, _) = self.frozen_memtables.as_ref();
-                lock_mutex(queue_mutex).iter().cloned().collect()
+                lock_mutex(queue_mutex)
+                    .iter()
+                    .map(|f| f.data.clone())
+                    .collect()
             };
             for frozen in frozen_snapshot.iter().rev() {
                 if let Some(value) = frozen.get(key) {
@@ -406,11 +425,11 @@ where
     }
 
     #[instrument(skip(self, key))]
-    pub fn delete(&self, key: K) -> Result<(), NornsDbError> {
+    pub fn delete(&self, key: K, handle: H) -> Result<(), NornsDbError> {
         let start = Instant::now();
         debug!("writing tombstone for key");
 
-        self.write_value(key, Value::Tombstone)?;
+        self.write_value(key, Value::Tombstone, handle)?;
 
         histogram!("norns_lsm_delete_duration_us", &self.metrics_labels)
             .record(start.elapsed().as_micros() as f64);
@@ -426,14 +445,13 @@ where
         // Rotate the active memtable into the frozen queue if it has data.
         // This ensures flush_sync persists everything, not just previously rotated memtables.
         {
-            let mut memtable = lock_write(&self.memtable);
-            if !memtable.is_empty() {
+            let mut active = lock_write(&self.memtable);
+            if let Some(frozen) = active.freeze() {
                 let (queue_mutex, condvar) = self.frozen_memtables.as_ref();
                 let mut queue = lock_mutex(queue_mutex);
                 while queue.len() >= self.max_frozen_memtables {
                     queue = condvar.wait(queue).unwrap_or_else(|e| e.into_inner());
                 }
-                let frozen = Arc::new(std::mem::take(&mut *memtable));
                 queue.push_back(frozen);
             }
         }
@@ -452,18 +470,20 @@ where
         Ok(())
     }
 
-    fn write_value(&self, key: K, value: Value<V>) -> Result<(), NornsDbError> {
+    fn write_value(&self, key: K, value: Value<V>, handle: H) -> Result<(), NornsDbError> {
         let should_flush = {
-            let mut memtable = lock_write(&self.memtable);
-            memtable.insert(key, value);
-            if memtable.len() >= self.memtable_size {
-                let (queue_mutex, condvar) = self.frozen_memtables.as_ref();
-                let mut queue = lock_mutex(queue_mutex);
-                while queue.len() >= self.max_frozen_memtables {
-                    queue = condvar.wait(queue).unwrap_or_else(|e| e.into_inner());
+            let mut active = lock_write(&self.memtable);
+            active.insert(key, value, handle);
+
+            if active.len() >= self.memtable_size {
+                if let Some(frozen) = active.freeze() {
+                    let (queue_mutex, condvar) = self.frozen_memtables.as_ref();
+                    let mut queue = lock_mutex(queue_mutex);
+                    while queue.len() >= self.max_frozen_memtables {
+                        queue = condvar.wait(queue).unwrap_or_else(|e| e.into_inner());
+                    }
+                    queue.push_back(frozen);
                 }
-                let frozen = Arc::new(std::mem::take(&mut *memtable));
-                queue.push_back(frozen);
                 true
             } else {
                 false

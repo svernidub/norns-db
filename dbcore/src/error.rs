@@ -43,6 +43,9 @@ pub enum NornsDbError {
         source: Box<dyn std::error::Error + Send + Sync>,
         message: String,
     },
+
+    #[error("impossible error: {message}")]
+    Impossible { message: String },
 }
 
 impl NornsDbError {
@@ -53,6 +56,15 @@ impl NornsDbError {
     {
         NornsDbError::Internal {
             source: Box::new(error),
+            message: message.into(),
+        }
+    }
+
+    pub fn impossible<S>(message: S) -> Self
+    where
+        S: Into<String>,
+    {
+        NornsDbError::Impossible {
             message: message.into(),
         }
     }

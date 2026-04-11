@@ -4,4 +4,12 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
-pub type FrozenMemtables<K, V> = Arc<(Mutex<VecDeque<Arc<BTreeMap<K, Value<V>>>>>, Condvar)>;
+pub(super) struct FrozenMemtable<K, V, H> {
+    pub data: BTreeMap<K, Value<V>>,
+    pub recent_handle: H,
+}
+
+// We use double Arc here for fast clones on flushes. The data will be flushed, while
+// the queue is accessible for read
+pub(super) type FrozenMemtables<K, V, H> =
+    Arc<(Mutex<VecDeque<Arc<FrozenMemtable<K, V, H>>>>, Condvar)>;
