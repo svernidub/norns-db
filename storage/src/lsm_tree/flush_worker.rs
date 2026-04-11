@@ -17,36 +17,11 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 
-pub(super) enum FlushWorkerCommand {
-    Flush,
-    FlushSync { tx: SyncSender<()> },
-    Stop { tx: SyncSender<()> },
-}
-
-pub(super) struct FlushWorkerParams<K, V>
-where
-    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-    V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-{
-    pub(super) frozen_memtables: FrozenMemtables<K, V>,
-    pub(super) data_directory: PathBuf,
-    pub(super) ss_table_block_size: usize,
-    pub(super) level_0_size: usize,
-    pub(super) current_store_version: Arc<ArcSwap<Storage<K, V>>>,
-    pub(super) metrics_labels: [(&'static str, String); 1],
-    pub(super) memtable_size: usize,
-    pub(super) compaction_worker: LsmTreeCompactionWorker<K, V>,
-    pub(super) version_lock: Arc<Mutex<()>>,
-}
-
-pub(super) struct LsmTreeFlushWorker<K, V>
-where
-    K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-    V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
-{
-    frozen_memtables: FrozenMemtables<K, V>,
+pub(crate) struct LsmTreeFlushWorker<K, V, H> {
+    frozen_memtables: FrozenMemtables<K, V, H>,
     data_directory: PathBuf,
     ss_table_block_size: usize,
     level_0_size: usize,
@@ -56,12 +31,33 @@ where
     compaction_worker: LsmTreeCompactionWorker<K, V>,
     version_lock: Arc<Mutex<()>>,
     tx: SyncSender<FlushWorkerCommand>,
+    commit_tx: UnboundedSender<H>,
 }
 
-impl<K, V> Clone for LsmTreeFlushWorker<K, V>
+pub(crate) struct FlushWorkerParams<K, V, H> {
+    pub frozen_memtables: FrozenMemtables<K, V, H>,
+    pub data_directory: PathBuf,
+    pub ss_table_block_size: usize,
+    pub level_0_size: usize,
+    pub current_store_version: Arc<ArcSwap<Storage<K, V>>>,
+    pub metrics_labels: [(&'static str, String); 1],
+    pub memtable_size: usize,
+    pub compaction_worker: LsmTreeCompactionWorker<K, V>,
+    pub version_lock: Arc<Mutex<()>>,
+    pub commit_tx: UnboundedSender<H>,
+}
+
+pub(crate) enum FlushWorkerCommand {
+    Flush,
+    FlushSync { tx: SyncSender<()> },
+    Stop { tx: SyncSender<()> },
+}
+
+impl<K, V, H> Clone for LsmTreeFlushWorker<K, V, H>
 where
     K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
     V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    H: Clone + Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -75,16 +71,18 @@ where
             compaction_worker: self.compaction_worker.clone(),
             version_lock: self.version_lock.clone(),
             tx: self.tx.clone(),
+            commit_tx: self.commit_tx.clone(),
         }
     }
 }
 
-impl<K, V> LsmTreeFlushWorker<K, V>
+impl<K, V, H> LsmTreeFlushWorker<K, V, H>
 where
     K: Hash + Clone + Ord + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
     V: Clone + bincode::Encode + bincode::Decode<()> + Send + Sync + 'static,
+    H: Clone + Sync + Send + 'static,
 {
-    pub(super) fn spawn(params: FlushWorkerParams<K, V>) -> Self {
+    pub(super) fn spawn(params: FlushWorkerParams<K, V, H>) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
 
         let worker = Self {
@@ -98,6 +96,7 @@ where
             compaction_worker: params.compaction_worker,
             version_lock: params.version_lock,
             tx,
+            commit_tx: params.commit_tx,
         };
 
         worker.run_thread(rx);
@@ -253,12 +252,15 @@ where
         let mut flushed_any = false;
 
         loop {
-            let data = {
-                let mut queue = lock_mutex(queue_mutex);
-                queue.pop_front()
+            let maybe_frozen = {
+                let queue = lock_mutex(queue_mutex);
+                queue.iter().next().cloned()
             };
 
-            let Some(data) = data else { break };
+            let Some(frozen) = maybe_frozen else {
+                info!("queue is empty");
+                break;
+            };
 
             flushed_any = true;
             let start = Instant::now();
@@ -275,7 +277,7 @@ where
                     .join(store.level_0_ss_tables.len().to_string());
 
                 let new_table = Arc::new(SsTable::new(
-                    (*data).clone(),
+                    frozen.data.clone(),
                     path,
                     self.ss_table_block_size,
                 )?);
@@ -289,10 +291,17 @@ where
                     level_1_ss_tables: store.level_1_ss_tables.clone(),
                 }));
 
-                condvar.notify_one();
-
                 new_level_0_count
             };
+
+            self.commit_tx.send(frozen.recent_handle.clone()).ok();
+
+            {
+                let mut queue = lock_mutex(queue_mutex);
+                queue.pop_front();
+            }
+
+            condvar.notify_one();
 
             histogram!("norns_lsm_flush_duration_ms", &self.metrics_labels)
                 .record(start.elapsed().as_millis() as f64);
@@ -303,7 +312,7 @@ where
         }
 
         if !flushed_any {
-            debug!("flush called but frozen queue is empty, skipping");
+            info!("flush called but frozen queue is empty, skipping");
             return Ok(());
         }
 

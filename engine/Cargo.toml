@@ -10,4 +10,5 @@ dbcore = { workspace = true }
 envconfig = { workspace = true }
 journal = { workspace = true }
 storage = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tracing = { workspace = true }

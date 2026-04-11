@@ -11,4 +11,5 @@ dbcore = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
 siphasher = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

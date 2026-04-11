@@ -1,4 +1,8 @@
+mod handle;
 mod journal;
-mod journal_record;
+mod record;
+#[cfg(test)]
+mod tests;
+mod writer_worker;
 
-pub use self::{journal::*, journal_record::*};
+pub use self::{handle::JournalHandle, journal::Journal, record::JournalRecordData};

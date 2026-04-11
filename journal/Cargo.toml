@@ -10,3 +10,6 @@ crc-fast = { workspace = true }
 dbcore = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }

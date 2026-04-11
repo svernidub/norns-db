@@ -4,17 +4,17 @@ use crate::{
     row::Row,
 };
 use dbcore::error::NornsDbError;
-use journal::{Journal, JournalRecord, JournalRecordKind};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use journal::{Journal, JournalHandle, JournalRecordData};
+use std::{path::PathBuf, sync::Arc};
 use storage::lsm_tree::LsmTree;
+use tokio::sync::Mutex;
+use tracing::error;
 
 pub struct Table {
     schema: Arc<TableSchema>,
-    storage: LsmTree<PrimaryKey, Row>,
-    journal: Journal<PrimaryKey, Row>,
+    storage: LsmTree<PrimaryKey, Row, JournalHandle>,
+    journal: Arc<Mutex<Journal<PrimaryKey, Row>>>,
+    _commit_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, bincode::Encode, bincode::Decode)]
@@ -46,8 +46,21 @@ impl Table {
     ) -> Result<Self, NornsDbError> {
         std::fs::create_dir_all(&data_directory)?;
 
-        let wal_path = Path::new(&data_directory).join("wal.log");
-        let journal = Journal::new(wal_path)?;
+        let wal_path = data_directory.join("wal.log");
+        let journal = Arc::new(Mutex::new(Journal::new(wal_path)?));
+
+        let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel::<JournalHandle>();
+
+        let journal_ref = journal.clone();
+
+        let commit_task = tokio::spawn(async move {
+            while let Some(handle) = commit_rx.recv().await {
+                let j = journal_ref.lock().await;
+                if let Err(e) = j.commit(handle).await {
+                    error!(?e, "journal commit failed after flush");
+                }
+            }
+        });
 
         let storage = LsmTree::new(
             name,
@@ -56,12 +69,14 @@ impl Table {
             level_0_size,
             ss_table_block_size,
             max_frozen_memtables,
+            commit_tx,
         )?;
 
         Ok(Self {
             schema: Arc::new(schema),
             storage,
             journal,
+            _commit_task: commit_task,
         })
     }
 
@@ -72,33 +87,61 @@ impl Table {
         max_frozen_memtables: usize,
     ) -> Result<Self, NornsDbError> {
         let wal_path = data_directory.join("wal.log");
+        let journal = Arc::new(Mutex::new(Journal::new(wal_path)?));
+
+        let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel::<JournalHandle>();
+
+        let journal_ref = journal.clone();
+        let commit_task = tokio::spawn(async move {
+            while let Some(handle) = commit_rx.recv().await {
+                let j = journal_ref.lock().await;
+                if let Err(e) = j.commit(handle).await {
+                    error!(?e, "journal commit failed after flush");
+                }
+            }
+        });
 
         Ok(Self {
             schema: Arc::new(schema),
-            storage: LsmTree::load(name, data_directory, max_frozen_memtables)?,
-            journal: Journal::new(wal_path)?,
+            storage: LsmTree::load(name, data_directory, max_frozen_memtables, commit_tx)?,
+            journal,
+            _commit_task: commit_task,
         })
     }
 
     pub async fn destroy(self) -> Result<(), NornsDbError> {
-        self.journal.shutdown().await?;
-        self.storage.destroy()?;
-        Ok(())
+        let Self {
+            storage,
+            journal,
+            _commit_task,
+            ..
+        } = self;
+
+        storage.destroy()?;
+        _commit_task.await.ok();
+
+        let journal = Arc::try_unwrap(journal)
+            .map_err(|_| NornsDbError::impossible("journal Arc has unexpected extra references"))?
+            .into_inner();
+
+        journal.shutdown().await
     }
 
     pub async fn insert(&self, primary_key: PrimaryKey, row: Row) -> Result<(), NornsDbError> {
         self.validate_key(&primary_key)?;
         self.validate_row(&row)?;
 
-        let record = JournalRecord::new(JournalRecordKind::Upsert {
+        let record = JournalRecordData::Upsert {
             key: primary_key.clone(),
             value: row.clone(),
-        });
+        };
 
-        self.journal.append(&record).await?;
-
-        self.storage.insert(primary_key, row)?;
-        Ok(())
+        // Hold the journal lock across append + storage insert to preserve ordering.
+        {
+            let journal = self.journal.lock().await;
+            let handle = journal.append(record).await?;
+            self.storage.insert(primary_key, row, handle)
+        }
     }
 
     pub fn get(&self, primary_key: &PrimaryKey) -> Result<Option<Row>, NornsDbError> {
@@ -110,13 +153,16 @@ impl Table {
     }
 
     pub async fn delete(&self, primary_key: PrimaryKey) -> Result<(), NornsDbError> {
-        let record = JournalRecord::new(JournalRecordKind::Delete {
+        let record = JournalRecordData::Delete {
             key: primary_key.clone(),
-        });
+        };
 
-        self.journal.append(&record).await?;
-
-        self.storage.delete(primary_key)
+        // Hold the journal lock across append + storage delete to preserve ordering.
+        {
+            let journal = self.journal.lock().await;
+            let handle = journal.append(record).await?;
+            self.storage.delete(primary_key, handle)
+        }
     }
 
     pub fn schema(&self) -> Arc<TableSchema> {
